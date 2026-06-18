@@ -1,0 +1,117 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+/**
+ * @file kernel_args.h
+ * @brief KernelArgs Structure - Shared between Host, AICPU, and AICore
+ *
+ * This structure is used to pass arguments to both AICPU and AICore kernels.
+ * It contains pointers to device memory for arguments and runtime data.
+ *
+ * Platform Support:
+ * - a2a3: Real hardware with CANN runtime compatibility
+ * - a2a3sim: Host-based simulation using standard memory
+ *
+ * Memory Layout (a2a3):
+ * This structure's layout is hardcoded in libaicpu_extend_kernels.so, which
+ * expects specific offsets for deviceArgs fields. The unused[5] array provides
+ * the required offset alignment for compatibility with the CANN runtime.
+ *
+ * Memory Layout (a2a3sim):
+ * For simulation, the layout is maintained for API compatibility, though
+ * we use host memory instead of device memory.
+ */
+
+#ifndef PLATFORM_COMMON_KERNEL_ARGS_H_
+#define PLATFORM_COMMON_KERNEL_ARGS_H_
+
+#include <cstdint>
+
+// Forward declarations
+class DeviceArgs;
+class Runtime;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Define __may_used_by_aicore__ qualifier for platform compatibility
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+#define __may_used_by_aicore__ __gm__
+#else
+#define __may_used_by_aicore__
+#endif
+
+/**
+ * Kernel arguments structure
+ *
+ * This structure is passed to AICPU kernels by the host.
+ *
+ * Field Access Patterns:
+ * - unused[5]: Padding for alignment with CANN runtime expectations
+ * - device_args: Written by host, read by AICPU (contains aicpu_so_bin/aicpu_so_len)
+ * - runtime_args: Written by host, read by AICPU (task runtime, includes
+ *   handshake buffers)
+ * - dump_data_base: Written by host, read by AICPU platform layer; zero when
+ *   tensor dump is unused
+ * - pmu_data_base: Written by host platform, read by AICPU platform layer;
+ *   zero when PMU is unused
+ * - dep_gen_data_base: Written by host platform, read by AICPU platform layer;
+ *   zero when dep_gen capture is unused
+ *
+ * enable_profiling_flag bit definitions (umbrella bitmask — "profiling" is
+ * the umbrella, each bit is a parallel diagnostics sub-feature):
+ * - bit0: tensor dump enabled
+ * - bit1: L2 swimlane enabled
+ * - bit2: PMU enabled
+ * - bit3: dep_gen capture enabled
+ *
+ * Field Access Patterns:
+ *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
+ *       - AICore: receives KernelArgs* via KERNEL_ENTRY
+ */
+struct KernelArgs {
+    uint64_t unused[5] = {0};                               // Alignment padding (required by CANN runtime offset)
+    DeviceArgs *device_args{nullptr};                       // Device arguments (AICPU reads, contains SO info)
+    __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
+    uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
+    uint64_t dump_data_base{0};         // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_perf_data_base{0};      // L2 perf shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
+    uint64_t aicore_ring_addr{0};       // Device ptr to a uint64_t[num_aicore] table holding each core's
+                                        // L2PerfAicoreRing address. AICore kernel entry indexes by block_idx
+                                        // and forwards into platform set/get state. 0 when L2 swimlane is off.
+    uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
+    uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    uint32_t _pad{0};                   // Alignment padding
+
+    // Device pointer to an 8-byte buffer that the platform AICPU entry writes
+    // the run-wall (ns) into. Allocated once at simpler_init, kept resident.
+    // Onboard AICPU receives KernelArgs as a CANN-private copy (see
+    // rtAicpuKernelLaunchExWithArgs in launch_aicpu_kernel), so an inline
+    // field on KernelArgs is write-only from AICPU — host has no way to read
+    // it back. The dedicated device buffer is host-allocated and the address
+    // travels via this field; AICPU writes `*(uint64_t*)device_wall_data_base
+    // = wall_ns`, host pulls the 8 bytes via rtMemcpy(... DEVICE_TO_HOST)
+    // after stream sync. Sim's "device pointer" is a host malloc'd uint64
+    // (no special-casing — write-through works because sim AICPU and host
+    // share memory). Zero when the buffer was not allocated.
+    uint64_t device_wall_data_base{0};
+};
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // PLATFORM_COMMON_KERNEL_ARGS_H_

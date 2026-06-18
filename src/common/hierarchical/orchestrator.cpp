@@ -1,0 +1,470 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "orchestrator.h"
+
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+#include "worker_manager.h"
+
+void Orchestrator::init(
+    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
+    ReadyQueue *ready_sub_queue, WorkerManager *manager
+) {
+    tensormap_ = tensormap;
+    allocator_ = allocator;
+    scope_ = scope;
+    ready_next_level_queue_ = ready_next_level_queue;
+    ready_sub_queue_ = ready_sub_queue;
+    manager_ = manager;
+    active_tasks_.store(0, std::memory_order_relaxed);
+}
+
+uint64_t Orchestrator::malloc(int worker_id, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::malloc: invalid worker_id");
+    return wt->control_malloc(size);
+}
+
+void Orchestrator::free(int worker_id, uint64_t ptr) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::free: invalid worker_id");
+    wt->control_free(ptr);
+}
+
+void Orchestrator::copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::copy_to: invalid worker_id");
+    wt->control_copy_to(dst, src, size);
+}
+
+void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::copy_from: invalid worker_id");
+    wt->control_copy_from(dst, src, size);
+}
+
+TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
+    TaskSlotState *p = allocator_->slot_state(s);
+    if (!p) throw std::runtime_error("Orchestrator::slot_state: invalid slot id");
+    return *p;
+}
+
+// ---------------------------------------------------------------------------
+// alloc(shape, dtype) — user-facing intermediate buffer from the HeapRing
+// ---------------------------------------------------------------------------
+
+uint64_t Orchestrator::output_alloc_bytes(const ContinuousTensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
+
+ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    if (shape.size() > CONTINUOUS_TENSOR_MAX_DIMS) {
+        throw std::invalid_argument("Orchestrator::alloc: shape exceeds CONTINUOUS_TENSOR_MAX_DIMS");
+    }
+
+    uint64_t numel = 1;
+    for (uint32_t d : shape)
+        numel *= static_cast<uint64_t>(d);
+    uint64_t bytes = numel * get_element_size(dtype);
+    uint64_t aligned = align_up(bytes, HEAP_ALIGN);
+
+    // 0-byte request (e.g. shape with a zero dim) flows straight through the
+    // allocator as a slot-only claim — matches reserve_outputs_and_slot.
+    // Skip tensormap registration when the returned heap_ptr is nullptr,
+    // since 0 is the sentinel for "no tensor" in infer_deps.
+    //
+    // Inherit the caller's scope depth so alloc buffers land in the same
+    // ring as any tasks submitted inside that scope — an alloc inside a
+    // nested `with orch.scope():` uses the nested ring and reclaims
+    // independently of the outer ring (Strict-1).
+    AllocResult ar = allocator_->alloc(aligned, scope_->current_depth());
+    if (ar.slot == INVALID_SLOT) {
+        throw std::runtime_error("Orchestrator::alloc: allocator shutdown");
+    }
+
+    TaskSlotState &s = slot_state(ar.slot);
+    s.reset();
+
+    uint64_t ptr = reinterpret_cast<uint64_t>(ar.heap_ptr);
+    if (ptr != 0) {
+        TensorKey key{ptr, -1};  // alloc is always host memory
+        tensormap_->insert(key, ar.slot);
+        s.output_keys.push_back(key);
+    }
+
+    // No fanin — alloc has no work to wait on.
+    s.fanin_count = 0;
+    s.fanin_released.store(0, std::memory_order_relaxed);
+
+    // Initial fanout_total = scope_ref. Consumers that wire on this slot
+    // will increment fanout_total in infer_deps.
+    int32_t scope_ref = (scope_->depth() > 0) ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> lk(s.fanout_mu);
+        s.fanout_total = scope_ref;
+    }
+    // Simulate the self try_consume that on_task_complete would normally
+    // contribute for a slot that ran through the scheduler. Without this
+    // bump, the fanout-release threshold (`>= total + 1`) would be one
+    // short and the slot would never reach CONSUMED.
+    s.fanout_released.store(1, std::memory_order_relaxed);
+    if (scope_ref > 0) scope_->register_task(ar.slot);
+
+    s.state.store(TaskState::COMPLETED, std::memory_order_release);
+
+    active_tasks_.fetch_add(1, std::memory_order_relaxed);
+
+    ContinuousTensor t{};
+    t.data = ptr;
+    t.dtype = dtype;
+    t.ndims = static_cast<uint32_t>(shape.size());
+    for (size_t i = 0; i < shape.size(); ++i)
+        t.shapes[i] = shape[i];
+    return t;
+}
+
+// =============================================================================
+// User-facing submit_* — thin wrappers around submit_impl
+// =============================================================================
+
+SubmitResult
+Orchestrator::submit_next_level(int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
+    std::vector<int8_t> affinities;
+    if (worker >= 0) affinities = {worker};
+    return submit_impl(WorkerType::NEXT_LEVEL, callable_id, config, {args}, std::move(affinities));
+}
+
+SubmitResult Orchestrator::submit_next_level_group(
+    int32_t callable_id, const std::vector<TaskArgs> &args_list, const CallConfig &config,
+    const std::vector<int8_t> &workers
+) {
+    return submit_impl(WorkerType::NEXT_LEVEL, callable_id, config, args_list, workers);
+}
+
+SubmitResult Orchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
+    return submit_impl(WorkerType::SUB, callable_id, CallConfig{}, {args});
+}
+
+SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list) {
+    return submit_impl(WorkerType::SUB, callable_id, CallConfig{}, args_list);
+}
+
+// =============================================================================
+// submit_impl — shared 7-step submit machinery
+// =============================================================================
+
+SubmitResult Orchestrator::submit_impl(
+    WorkerType worker_type, int32_t callable_id, const CallConfig &config, std::vector<TaskArgs> args_list,
+    std::vector<int8_t> affinities
+) {
+    if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
+    config.validate();
+
+    // Fail-fast: if a previously-dispatched task has already failed, abort
+    // this submit before any bookkeeping so the orch fn unwinds promptly
+    // and no further work is queued. Tasks already in flight run to
+    // completion; drain() picks up any remaining bookkeeping and rethrows
+    // at the finally: _drain() site in Worker.run.
+    if (manager_ && manager_->has_error()) {
+        std::rethrow_exception(manager_->take_error());
+    }
+
+    // Track this submission for drain() before any allocations so the count
+    // is incremented exactly once per submitted DAG node, regardless of the
+    // group_size N.
+    active_tasks_.fetch_add(1, std::memory_order_relaxed);
+
+    // --- Step 1: Atomically claim slot + auto-alloc any OUTPUT tensors that
+    // arrived with a null data pointer. Both resources come from the same
+    // merged allocator (Strict-2) so there is no partial-failure rollback
+    // path.
+    AllocResult ar = reserve_outputs_and_slot(args_list);
+    if (ar.slot == INVALID_SLOT) {
+        active_tasks_.fetch_sub(1, std::memory_order_relaxed);
+        throw std::runtime_error("Orchestrator: allocator shutdown");
+    }
+    TaskSlot slot = ar.slot;
+
+    TaskSlotState &s = slot_state(slot);
+    s.reset();
+
+    s.worker_type = worker_type;
+    s.callable_id = callable_id;
+    s.config = config;
+
+    // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
+    // (outputs). Must happen before we move args_list into the slot because
+    // infer_deps reads tensor data pointers and tags from it.
+    std::vector<TaskSlot> producers;
+    infer_deps(slot, args_list, affinities, producers, s.output_keys);
+
+    // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
+    // Dispatch builds a TaskArgsView on demand via `slot.args_view(i)`
+    // (THREAD mode) or write_blob → read_blob (PROCESS mode). The L2 ABI
+    // ChipStorageTaskArgs conversion now runs inside ChipWorker::run
+    // rather than at submit time.
+    if (args_list.size() == 1) {
+        s.is_group_ = false;
+        s.task_args = std::move(args_list.front());
+    } else {
+        s.is_group_ = true;
+        s.task_args_list = std::move(args_list);
+    }
+    s.affinities = std::move(affinities);
+
+    // --- Step 5: Finalize fanin — lock each producer's fanout_mu, attach ---
+    //
+    // For COMPLETED producers (notably alloc-created synthetic slots), we
+    // still wire the fanout edge so the producer waits for this consumer
+    // before being CONSUMED (and freeing any owned buffers). The consumer
+    // itself doesn't gain a live fanin — it can run immediately because the
+    // producer is already done. CONSUMED producers are gone (resources freed),
+    // so we skip them entirely.
+    int32_t live_fanins = 0;
+    for (TaskSlot prod : producers) {
+        TaskSlotState &ps = slot_state(prod);
+        std::lock_guard<std::mutex> lk(ps.fanout_mu);
+
+        TaskState ps_state = ps.state.load(std::memory_order_acquire);
+        if (ps_state == TaskState::CONSUMED) {
+            continue;
+        }
+        ps.fanout_consumers.push_back(slot);
+        ps.fanout_total++;
+        s.fanin_producers.push_back(prod);
+        if (ps_state != TaskState::COMPLETED) {
+            live_fanins++;
+        }
+    }
+
+    s.fanin_count = live_fanins;
+    s.fanin_released.store(0, std::memory_order_relaxed);
+
+    int32_t scope_ref = (scope_->depth() > 0) ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> lk(s.fanout_mu);
+        s.fanout_total = scope_ref;
+    }
+    s.fanout_released.store(0, std::memory_order_relaxed);
+
+    if (scope_ref > 0) scope_->register_task(slot);
+
+    // --- Step 6: If no live fanins → READY ---
+    // Strict-4: push to the queue dedicated to this task's worker type so a
+    // saturated sub pool cannot stall next-level dispatch (and vice versa).
+    if (live_fanins == 0) {
+        s.state.store(TaskState::READY, std::memory_order_release);
+        ready_queue_for(worker_type)->push(slot);
+    } else {
+        s.state.store(TaskState::PENDING, std::memory_order_release);
+    }
+
+    return SubmitResult{slot};
+}
+
+// =============================================================================
+// reserve_outputs_and_slot — atomic slot + heap carve-up for this submit
+// =============================================================================
+//
+// Walks every OUTPUT-tagged tensor that arrived with `data == 0` and reserves
+// aligned slabs out of a single contiguous HeapRing allocation. OUTPUT tensors
+// with a user-supplied data pointer are left untouched (that's the
+// OUTPUT_EXISTING-equivalent back-compat path for callers that pre-fill
+// OUTPUT.data themselves). The single allocator call owns both the slot and
+// the heap range, so there is no partial-failure rollback.
+
+AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_list) {
+    uint64_t total_bytes = 0;
+    for (const TaskArgs &a : args_list) {
+        for (int32_t i = 0; i < a.tensor_count(); ++i) {
+            if (a.tag(i) != TensorArgType::OUTPUT) continue;
+            if (a.tensor(i).data != 0) continue;  // user supplied a pointer — leave alone
+            total_bytes += output_alloc_bytes(a.tensor(i));
+        }
+    }
+
+    AllocResult ar = allocator_->alloc(total_bytes, scope_->current_depth());
+    if (ar.slot == INVALID_SLOT) return ar;
+
+    // Hand slabs out in the same order we counted them.
+    uint64_t off = 0;
+    char *base = static_cast<char *>(ar.heap_ptr);
+    for (TaskArgs &a : args_list) {
+        for (int32_t i = 0; i < a.tensor_count(); ++i) {
+            if (a.tag(i) != TensorArgType::OUTPUT) continue;
+            ContinuousTensor &t = a.tensor(i);
+            if (t.data != 0) continue;
+            uint64_t slab = output_alloc_bytes(t);
+            t.data = reinterpret_cast<uint64_t>(base + off);
+            off += slab;
+        }
+    }
+    return ar;
+}
+
+// =============================================================================
+// infer_deps — tag-driven dependency inference
+// =============================================================================
+
+void Orchestrator::infer_deps(
+    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+    std::vector<TaskSlot> &producers, std::vector<TensorKey> &output_keys
+) {
+    auto add_unique_producer = [&](TaskSlot p) {
+        // Group submits walk many TaskArgs under one slot: if two entries in
+        // the same group tag the same buffer (e.g. both OUTPUT 0xCAFE), the
+        // second-pass lookup would return the slot that the first pass just
+        // inserted — a self-loop. Skip it.
+        if (p == slot) return;
+        for (TaskSlot existing : producers) {
+            if (existing == p) return;
+        }
+        producers.push_back(p);
+    };
+
+    // Tag-driven dependency inference — mirrors L2
+    // (src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp
+    //  steps B and 4):
+    //   INPUT            → lookup only (RaW)
+    //   INOUT            → lookup + insert (RaW + WaW)
+    //   OUTPUT_EXISTING  → insert only (user-provided buffer; any WaW dep on
+    //                      the creator must be expressed via INOUT instead)
+    //   OUTPUT           → insert only (pure overwrite; if auto-alloc is
+    //                      needed, the data ptr is assigned in
+    //                      reserve_outputs_and_slot before this step)
+    //   NO_DEP           → skip
+    for (size_t g = 0; g < args_list.size(); ++g) {
+        int8_t worker_id = (g < affinities.size()) ? affinities[g] : int8_t(-1);
+        const TaskArgs &a = args_list[g];
+        for (int32_t i = 0; i < a.tensor_count(); ++i) {
+            const ContinuousTensor &t = a.tensor(i);
+            if (t.data == 0) continue;  // null tensor — nothing to track
+            TensorKey key{t.data, t.is_child_memory() ? worker_id : int8_t(-1)};
+            TensorArgType tag = a.tag(i);
+            switch (tag) {
+            case TensorArgType::INPUT: {
+                TaskSlot prod = tensormap_->lookup(key);
+                if (prod != INVALID_SLOT) add_unique_producer(prod);
+                break;
+            }
+            case TensorArgType::INOUT: {
+                TaskSlot prod = tensormap_->lookup(key);
+                if (prod != INVALID_SLOT) add_unique_producer(prod);
+                tensormap_->insert(key, slot);
+                output_keys.push_back(key);
+                break;
+            }
+            case TensorArgType::OUTPUT:
+            case TensorArgType::OUTPUT_EXISTING: {
+                tensormap_->insert(key, slot);
+                output_keys.push_back(key);
+                break;
+            }
+            case TensorArgType::NO_DEP:
+            default:
+                break;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Scope
+// =============================================================================
+
+void Orchestrator::scope_begin() { scope_->scope_begin(); }
+
+void Orchestrator::scope_end() {
+    scope_->scope_end([this](TaskSlot slot) {
+        release_ref(slot);
+    });
+}
+
+// =============================================================================
+// Reference release helpers
+// =============================================================================
+
+void Orchestrator::release_ref(TaskSlot slot) {
+    TaskSlotState &s = slot_state(slot);
+    int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int32_t total;
+    {
+        std::lock_guard<std::mutex> lk(s.fanout_mu);
+        total = s.fanout_total;
+    }
+    // Threshold matches Scheduler::try_consume: total contributors are
+    // 1 (self try_consume from on_task_complete, or the alloc-time sim) +
+    // N (per consumer's deferred try_consume) + 1 (this scope_end release)
+    // = N + 2 = total + 1 where total = scope_ref + N.
+    // Using `>= total + 1` keeps scope_end from prematurely consuming while
+    // a consumer (or a HeapRing peer) is still live.
+    if (released >= total + 1 && s.state.load(std::memory_order_acquire) == TaskState::COMPLETED) {
+        on_consumed(slot);
+    }
+}
+
+bool Orchestrator::on_consumed(TaskSlot slot) {
+    TaskSlotState &s = slot_state(slot);
+
+    // Idempotent: the threshold can be hit by either release_ref (scope_end,
+    // Orch thread) or try_consume (consumer's deferred release, scheduler
+    // thread). Whichever fires last wins; subsequent callers see CONSUMED
+    // and bail.
+    TaskState expected = TaskState::COMPLETED;
+    if (!s.state.compare_exchange_strong(
+            expected, TaskState::CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return false;
+    }
+
+    tensormap_->erase_task_outputs(s.output_keys);
+
+    // HeapRing-owned OUTPUT slabs are reclaimed implicitly when the allocator
+    // advances last_alive past this slot — no per-slot munmap needed.
+    allocator_->release(slot);
+
+    // Decrement active-task counter so drain() observes completion. Gated
+    // on the CAS win so both consume paths — release_ref (Orch thread,
+    // scope_end) and try_consume (scheduler thread, consumer's deferred
+    // release) — decrement exactly once. Notify drain_cv when the count
+    // hits zero.
+    int32_t remaining = active_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining == 0) {
+        std::lock_guard<std::mutex> lk(drain_mu_);
+        drain_cv_.notify_all();
+    }
+    return true;
+}
+
+void Orchestrator::drain() {
+    {
+        std::unique_lock<std::mutex> lk(drain_mu_);
+        drain_cv_.wait(lk, [this] {
+            return active_tasks_.load(std::memory_order_acquire) == 0;
+        });
+    }
+    // Every slot is CONSUMED (active_tasks_ == 0 ⇒ allocator last_alive_ ==
+    // next_task_id_). Drop all per-slot state so the next Worker.run()
+    // starts from task_id = 0 with no accumulated memory.
+    allocator_->reset_to_empty();
+
+    // Rethrow the first dispatch failure seen during this run. Deferred to
+    // after allocator reset so the next Worker.run() can proceed cleanly
+    // once clear_error() is called.
+    if (manager_ && manager_->has_error()) {
+        std::rethrow_exception(manager_->take_error());
+    }
+}
+
+void Orchestrator::clear_error() {
+    if (manager_) manager_->clear_error();
+}
