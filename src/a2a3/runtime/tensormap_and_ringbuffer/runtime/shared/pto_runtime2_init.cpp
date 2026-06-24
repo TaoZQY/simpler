@@ -186,6 +186,9 @@ bool PTO2SchedulerState::init_data_from_layout(
     sched->wiring.batch_count = 0;
     sched->wiring.batch_index = 0;
     sched->wiring.backoff_counter = 0;
+    sched->wiring.orch_needs_drain.store(false, std::memory_order_relaxed);
+    sched->wiring.orch_drain_hint_seq.store(0, std::memory_order_relaxed);
+    sched->wiring.orch_drain_hint_seen = 0;
 
     return true;
 }
@@ -279,7 +282,7 @@ bool PTO2OrchestratorState::init_data_from_layout(
     const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
 ) {
     auto *orch = this;
-    *orch = PTO2OrchestratorState{};
+    memset(orch, 0, sizeof(*orch));
 
     orch->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
     orch->gm_heap_base = gm_heap;
@@ -328,6 +331,32 @@ bool PTO2OrchestratorState::init_data_from_layout(
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
+    orch->submit_pipeline_enabled = false;
+    orch->submit_pipeline_enqueue_submit_records = false;
+    orch->submit_pipeline_defer_dependencies = false;
+    orch->submit_pipeline_signal_scheduler_drain = false;
+    orch->submit_pipeline_compact_deferred_records = false;
+    orch->submit_pipeline_commit_stages = 0;
+    orch->submit_pipeline_stop.store(false, std::memory_order_relaxed);
+    orch->submit_pipeline_work_available.store(false, std::memory_order_relaxed);
+    orch->submit_pipeline_control.store(PTO2_SUBMIT_PIPELINE_CONTROL_IDLE, std::memory_order_relaxed);
+    orch->submit_pipeline_completed.store(0, std::memory_order_relaxed);
+    orch->submit_pipeline_current_task_batch_slot = -1;
+    orch->submit_pipeline_task_batch_count = 0;
+    orch->submit_pipeline_next_task_batch_slot = 0;
+    for (int stage = 0; stage < PTO2_SUBMIT_PIPELINE_MAX_COMMIT_STAGES; stage++) {
+        orch->submit_pipeline_stage_done[stage].store(false, std::memory_order_relaxed);
+        orch->submit_pipeline_queues[stage].tail.store(0, std::memory_order_relaxed);
+        orch->submit_pipeline_queues[stage].head.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < PTO2_SUBMIT_PIPELINE_QUEUE_CAP; i++) {
+            orch->submit_pipeline_queues[stage].slot_state[i].store(0, std::memory_order_relaxed);
+            orch->submit_pipeline_queues[stage].records[i] = PTO2SubmitCommitRecord{};
+        }
+    }
+    for (int i = 0; i < PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP; i++) {
+        orch->submit_pipeline_task_batch_slot_state[i].store(0, std::memory_order_relaxed);
+        orch->submit_pipeline_task_batch_slots[i] = PTO2SubmitTaskBatchSlot{};
+    }
 
     return true;
 }

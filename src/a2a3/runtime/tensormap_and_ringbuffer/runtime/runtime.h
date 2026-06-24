@@ -210,6 +210,8 @@ public:
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
+    int32_t pipeline_strategy;
+    bool pipeline_defer_submit_disabled;
 
 private:
     // Kernel binary tracking for cleanup

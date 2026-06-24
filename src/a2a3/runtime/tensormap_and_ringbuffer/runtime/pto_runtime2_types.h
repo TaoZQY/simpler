@@ -145,6 +145,7 @@ struct PTO2OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
     int32_t total_output_size = 0;
+    bool needs_tensormap_registration = false;
 };
 
 // =============================================================================
@@ -264,6 +265,9 @@ struct PTO2TaskPayload {
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
     uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
+    // Four bits per tensor argument encode TensorArgType so an assisted
+    // orchestrator can recompute deferred dependencies after payload.init().
+    uint64_t arg_tags_packed{0};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -309,9 +313,11 @@ struct PTO2TaskPayload {
     ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
+        arg_tags_packed = 0;
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
+            arg_tags_packed |= (static_cast<uint64_t>(static_cast<uint8_t>(args.tag(i))) & 0xfu) << (i * 4);
             if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(args.tensor(i).ref());
             } else {

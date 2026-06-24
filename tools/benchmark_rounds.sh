@@ -191,7 +191,7 @@ parse_timing() {
     local dev_timing_file
     dev_timing_file=$(mktemp)
     trap 'rm -f -- "$dev_timing_file"' RETURN
-    grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' \
+    grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_start|orch_stage_end|orch_pipeline_diag)' \
         "$log_file" > "$dev_timing_file" 2>/dev/null || true
 
     if [[ ! -s "$fw_file" && ! -s "$dev_timing_file" ]]; then
@@ -205,8 +205,27 @@ parse_timing() {
             total_results[round] = (max_end - min_start) / freq
             if (max_sched_end > 0 && min_sched_start > 0)
                 sched_results[round] = (max_sched_end - min_sched_start) / freq
-            if (max_orch_end > 0 && min_orch_start > 0)
+            if (max_orch_end > 0 && min_orch_start > 0) {
                 orch_results[round] = (max_orch_end - min_orch_start) / freq
+                o1_active_results[round] = orch_results[round]
+            }
+            if (max_stage_end > 0 && min_stage_start > 0) {
+                o2_active_results[round] = (max_stage_end - min_stage_start) / freq
+                if (min_orch_start > 0) {
+                    o_wall_start = min_orch_start < min_stage_start ? min_orch_start : min_stage_start
+                    o_wall_end = max_orch_end > max_stage_end ? max_orch_end : max_stage_end
+                    o2_wall_results[round] = (o_wall_end - o_wall_start) / freq
+                    o1_drain = (o_wall_end - max_orch_end) / freq
+                    o1_drain_results[round] = o1_drain > 0 ? o1_drain : 0
+                } else {
+                    o2_wall_results[round] = o2_active_results[round]
+                    o1_drain_results[round] = 0
+                }
+            }
+            if (pipe_enq_cost >= 0)
+                pipe_enq_results[round] = pipe_enq_cost
+            if (pipe_flush_cost >= 0)
+                pipe_flush_results[round] = pipe_flush_cost
             dev_count++
         }
     }
@@ -216,8 +235,11 @@ parse_timing() {
         min_start = 0; max_end = 0
         min_sched_start = 0; max_sched_end = 0
         min_orch_start = 0; max_orch_end = 0
+        min_stage_start = 0; max_stage_end = 0
+        pipe_enq_cost = -1; pipe_flush_cost = -1
         delete sched_seen
         delete orch_seen
+        delete stage_seen
     }
     function trimmed(label, arr, n, trim,    i, j, k, tc, ts) {
         for (i = 2; i <= n; i++) {
@@ -235,7 +257,11 @@ parse_timing() {
         min_start = 0; max_end = 0
         min_sched_start = 0; max_sched_end = 0
         min_orch_start = 0; max_orch_end = 0
+        min_stage_start = 0; max_stage_end = 0
         has_sched = 0; has_orch_end = 0
+        has_stage = 0
+        has_pipe = 0
+        pipe_enq_cost = -1; pipe_flush_cost = -1
         fw_n = 0; in_fw = 0
     }
     # First file: framework `_log_round_timings` stdout (Host / Device per round).
@@ -289,10 +315,39 @@ parse_timing() {
         if (val > max_orch_end) max_orch_end = val
         if (val > max_end) max_end = val
     }
+    /orch_stage_start=/ {
+        match($0, /Thread ([0-9]+):/, tm)
+        tid = tm[1] + 0
+        if (tid in stage_seen) new_round()
+        stage_seen[tid] = 1
+        has_stage = 1
+        match($0, /orch_stage_start=([0-9]+)/, m)
+        val = m[1] + 0
+        if (min_stage_start == 0 || val < min_stage_start) min_stage_start = val
+        if (min_start == 0 || val < min_start) min_start = val
+    }
     /orch_stage_end=/ {
         match($0, /orch_stage_end=([0-9]+)/, m)
         val = m[1] + 0
+        has_stage = 1
+        if (val > max_stage_end) max_stage_end = val
         if (val > max_end) max_end = val
+    }
+    /orch_pipeline_diag/ {
+        if (match($0, /task_enq_cost=([0-9.]+)us/, m)) {
+            if (pipe_enq_cost < 0) pipe_enq_cost = 0
+            pipe_enq_cost += m[1] + 0
+            has_pipe = 1
+        }
+        if (match($0, /scope_enq_cost=([0-9.]+)us/, m)) {
+            if (pipe_enq_cost < 0) pipe_enq_cost = 0
+            pipe_enq_cost += m[1] + 0
+            has_pipe = 1
+        }
+        if (match($0, /flush_cost=([0-9.]+)us/, m)) {
+            pipe_flush_cost = m[1] + 0
+            has_pipe = 1
+        }
     }
     END {
         flush_round()
@@ -303,6 +358,8 @@ parse_timing() {
         has_total  = (dev_count > 0)
         show_sched = has_sched
         show_orch  = has_orch_end
+        show_stage = has_stage
+        show_pipe  = has_pipe
 
         if (!has_total && fw_n == 0) {
             print "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -319,10 +376,17 @@ parse_timing() {
         if (has_total)  { hdr = hdr sprintf("  %12s", "Total (us)");  sep = sep sprintf("  %12s", "------------") }
         if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)");  sep = sep sprintf("  %12s", "------------") }
         if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");   sep = sep sprintf("  %12s", "------------") }
+        if (show_stage) { hdr = hdr sprintf("  %12s  %12s  %12s  %12s", "O1 Act (us)", "O1 Drain", "O2 Act (us)", "O2 Wall") }
+        if (show_stage) { sep = sep sprintf("  %12s  %12s  %12s  %12s", "------------", "------------", "------------", "------------") }
+        if (show_pipe)  { hdr = hdr sprintf("  %12s  %12s", "Pipe Enq", "Pipe Flush"); sep = sep sprintf("  %12s  %12s", "------------", "------------") }
         print hdr; print sep
 
         cnt_host = 0; cnt_dev = 0; cnt_tot = 0; cnt_sch = 0; cnt_orc = 0
         sum_host = 0; sum_dev = 0; sum_tot = 0; sum_sch = 0; sum_orc = 0
+        cnt_o1 = 0; cnt_o1_drain = 0; cnt_o2 = 0; cnt_o2_wall = 0
+        sum_o1 = 0; sum_o1_drain = 0; sum_o2 = 0; sum_o2_wall = 0
+        cnt_pipe_enq = 0; cnt_pipe_flush = 0
+        sum_pipe_enq = 0; sum_pipe_flush = 0
 
         for (i = 0; i < n_rounds; i++) {
             row = sprintf("  %-6d", i)
@@ -356,6 +420,34 @@ parse_timing() {
                     sum_orc += orch_results[i]; cnt_orc++; orc_arr[cnt_orc] = orch_results[i]
                 } else row = row sprintf("  %12s", "-")
             }
+            if (show_stage) {
+                if (i in o1_active_results) {
+                    row = row sprintf("  %12.1f", o1_active_results[i])
+                    sum_o1 += o1_active_results[i]; cnt_o1++; o1_arr[cnt_o1] = o1_active_results[i]
+                } else row = row sprintf("  %12s", "-")
+                if (i in o1_drain_results) {
+                    row = row sprintf("  %12.1f", o1_drain_results[i])
+                    sum_o1_drain += o1_drain_results[i]; cnt_o1_drain++; o1_drain_arr[cnt_o1_drain] = o1_drain_results[i]
+                } else row = row sprintf("  %12s", "-")
+                if (i in o2_active_results) {
+                    row = row sprintf("  %12.1f", o2_active_results[i])
+                    sum_o2 += o2_active_results[i]; cnt_o2++; o2_arr[cnt_o2] = o2_active_results[i]
+                } else row = row sprintf("  %12s", "-")
+                if (i in o2_wall_results) {
+                    row = row sprintf("  %12.1f", o2_wall_results[i])
+                    sum_o2_wall += o2_wall_results[i]; cnt_o2_wall++; o2_wall_arr[cnt_o2_wall] = o2_wall_results[i]
+                } else row = row sprintf("  %12s", "-")
+            }
+            if (show_pipe) {
+                if (i in pipe_enq_results) {
+                    row = row sprintf("  %12.1f", pipe_enq_results[i])
+                    sum_pipe_enq += pipe_enq_results[i]; cnt_pipe_enq++; pipe_enq_arr[cnt_pipe_enq] = pipe_enq_results[i]
+                } else row = row sprintf("  %12s", "-")
+                if (i in pipe_flush_results) {
+                    row = row sprintf("  %12.1f", pipe_flush_results[i])
+                    sum_pipe_flush += pipe_flush_results[i]; cnt_pipe_flush++; pipe_flush_arr[cnt_pipe_flush] = pipe_flush_results[i]
+                } else row = row sprintf("  %12s", "-")
+            }
             print row
         }
 
@@ -366,6 +458,12 @@ parse_timing() {
         if (has_total  && cnt_tot > 0)  { avg_line = avg_line avg_sep sprintf("Total Avg: %.1f us",  sum_tot  / cnt_tot);  avg_sep = "  |  " }
         if (show_sched && cnt_sch > 0)  { avg_line = avg_line avg_sep sprintf("Sched Avg: %.1f us",  sum_sch  / cnt_sch);  avg_sep = "  |  " }
         if (show_orch  && cnt_orc > 0)  { avg_line = avg_line avg_sep sprintf("Orch Avg: %.1f us",   sum_orc  / cnt_orc);  avg_sep = "  |  " }
+        if (show_stage && cnt_o1 > 0)       { avg_line = avg_line avg_sep sprintf("O1 Active Avg: %.1f us", sum_o1 / cnt_o1); avg_sep = "  |  " }
+        if (show_stage && cnt_o1_drain > 0) { avg_line = avg_line avg_sep sprintf("O1 Drain Avg: %.1f us",  sum_o1_drain / cnt_o1_drain); avg_sep = "  |  " }
+        if (show_stage && cnt_o2 > 0)       { avg_line = avg_line avg_sep sprintf("O2 Active Avg: %.1f us", sum_o2 / cnt_o2); avg_sep = "  |  " }
+        if (show_stage && cnt_o2_wall > 0)  { avg_line = avg_line avg_sep sprintf("O2 Wall Avg: %.1f us",   sum_o2_wall / cnt_o2_wall); avg_sep = "  |  " }
+        if (show_pipe && cnt_pipe_enq > 0)   { avg_line = avg_line avg_sep sprintf("Pipe Enq Avg: %.1f us",   sum_pipe_enq / cnt_pipe_enq); avg_sep = "  |  " }
+        if (show_pipe && cnt_pipe_flush > 0) { avg_line = avg_line avg_sep sprintf("Pipe Flush Avg: %.1f us", sum_pipe_flush / cnt_pipe_flush); avg_sep = "  |  " }
         printf "\n  %s  (%d rounds)\n", avg_line, n_rounds
 
         TRIM = 10
@@ -374,6 +472,12 @@ parse_timing() {
         if (cnt_tot  > 2 * TRIM) trimmed("Total",  tot_arr,  cnt_tot,  TRIM)
         if (cnt_sch  > 2 * TRIM) trimmed("Sched",  sch_arr,  cnt_sch,  TRIM)
         if (cnt_orc  > 2 * TRIM) trimmed("Orch",   orc_arr,  cnt_orc,  TRIM)
+        if (cnt_o1   > 2 * TRIM) trimmed("O1 Active", o1_arr, cnt_o1, TRIM)
+        if (cnt_o1_drain > 2 * TRIM) trimmed("O1 Drain", o1_drain_arr, cnt_o1_drain, TRIM)
+        if (cnt_o2   > 2 * TRIM) trimmed("O2 Active", o2_arr, cnt_o2, TRIM)
+        if (cnt_o2_wall > 2 * TRIM) trimmed("O2 Wall", o2_wall_arr, cnt_o2_wall, TRIM)
+        if (cnt_pipe_enq > 2 * TRIM) trimmed("Pipe Enq", pipe_enq_arr, cnt_pipe_enq, TRIM)
+        if (cnt_pipe_flush > 2 * TRIM) trimmed("Pipe Flush", pipe_flush_arr, cnt_pipe_flush, TRIM)
     }' "$fw_file" "$dev_timing_file"
 }
 
@@ -492,17 +596,31 @@ run_bench() {
     local avg_line
     avg_line=$(echo "$timing_output" | grep -E '(Host|Device|Total|Sched|Orch) Avg:' | grep -v 'Trimmed' | head -1 || true)
     local avg_host="-" avg_device="-" avg_total="-" avg_sched="-" avg_orch="-"
+    local avg_o1_active="-" avg_o1_drain="-" avg_o2_active="-" avg_o2_wall="-"
+    local avg_pipe_enq="-" avg_pipe_flush="-"
     if [[ -n "$avg_line" ]]; then
         avg_host=$(  echo "$avg_line" | grep -oE 'Host Avg: [0-9.]+'   || true); avg_host=${avg_host##* }
         avg_device=$(echo "$avg_line" | grep -oE 'Device Avg: [0-9.]+' || true); avg_device=${avg_device##* }
         avg_total=$( echo "$avg_line" | grep -oE 'Total Avg: [0-9.]+'  || true); avg_total=${avg_total##* }
         avg_sched=$( echo "$avg_line" | grep -oE 'Sched Avg: [0-9.]+'  || true); avg_sched=${avg_sched##* }
         avg_orch=$(  echo "$avg_line" | grep -oE 'Orch Avg: [0-9.]+'   || true); avg_orch=${avg_orch##* }
+        avg_o1_active=$(echo "$avg_line" | grep -oE 'O1 Active Avg: [0-9.]+' || true); avg_o1_active=${avg_o1_active##* }
+        avg_o1_drain=$( echo "$avg_line" | grep -oE 'O1 Drain Avg: [0-9.]+'  || true); avg_o1_drain=${avg_o1_drain##* }
+        avg_o2_active=$(echo "$avg_line" | grep -oE 'O2 Active Avg: [0-9.]+' || true); avg_o2_active=${avg_o2_active##* }
+        avg_o2_wall=$(  echo "$avg_line" | grep -oE 'O2 Wall Avg: [0-9.]+'   || true); avg_o2_wall=${avg_o2_wall##* }
+        avg_pipe_enq=$(  echo "$avg_line" | grep -oE 'Pipe Enq Avg: [0-9.]+'   || true); avg_pipe_enq=${avg_pipe_enq##* }
+        avg_pipe_flush=$(echo "$avg_line" | grep -oE 'Pipe Flush Avg: [0-9.]+' || true); avg_pipe_flush=${avg_pipe_flush##* }
         [[ -z "$avg_host" ]]   && avg_host="-"
         [[ -z "$avg_device" ]] && avg_device="-"
         [[ -z "$avg_total" ]]  && avg_total="-"
         [[ -z "$avg_sched" ]]  && avg_sched="-"
         [[ -z "$avg_orch" ]]   && avg_orch="-"
+        [[ -z "$avg_o1_active" ]] && avg_o1_active="-"
+        [[ -z "$avg_o1_drain" ]]  && avg_o1_drain="-"
+        [[ -z "$avg_o2_active" ]] && avg_o2_active="-"
+        [[ -z "$avg_o2_wall" ]]   && avg_o2_wall="-"
+        [[ -z "$avg_pipe_enq" ]]   && avg_pipe_enq="-"
+        [[ -z "$avg_pipe_flush" ]] && avg_pipe_flush="-"
     fi
 
     SUMMARY_NAMES+=("$label")
@@ -511,6 +629,12 @@ run_bench() {
     SUMMARY_TOTAL+=("$avg_total")
     SUMMARY_SCHED+=("$avg_sched")
     SUMMARY_ORCH+=("$avg_orch")
+    SUMMARY_O1_ACTIVE+=("$avg_o1_active")
+    SUMMARY_O1_DRAIN+=("$avg_o1_drain")
+    SUMMARY_O2_ACTIVE+=("$avg_o2_active")
+    SUMMARY_O2_WALL+=("$avg_o2_wall")
+    SUMMARY_PIPE_ENQ+=("$avg_pipe_enq")
+    SUMMARY_PIPE_FLUSH+=("$avg_pipe_flush")
 }
 
 # ---------------------------------------------------------------------------
@@ -526,6 +650,12 @@ SUMMARY_DEVICE=()
 SUMMARY_TOTAL=()
 SUMMARY_SCHED=()
 SUMMARY_ORCH=()
+SUMMARY_O1_ACTIVE=()
+SUMMARY_O1_DRAIN=()
+SUMMARY_O2_ACTIVE=()
+SUMMARY_O2_WALL=()
+SUMMARY_PIPE_ENQ=()
+SUMMARY_PIPE_FLUSH=()
 
 echo ""
 echo "Runtime: $RUNTIME"
@@ -580,12 +710,17 @@ done
 if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
     # Show only columns that have at least one non-"-" value
     _has_host=0; _has_device=0; _has_total=0; _has_sched=0; _has_orch=0
+    # Keep the summary schema aligned with tools/pipeline_metrics.py: once
+    # Host/Device columns are present, the O/Pipe placeholders make each row
+    # parse as host,device,total,sched,orch,o1,o1_drain,o2,o2_wall,pipe_enq,pipe_flush.
+    _has_o_split=1
     for _i in "${!SUMMARY_NAMES[@]}"; do
         [[ "${SUMMARY_HOST[$_i]}"   != "-" ]] && _has_host=1
         [[ "${SUMMARY_DEVICE[$_i]}" != "-" ]] && _has_device=1
         [[ "${SUMMARY_TOTAL[$_i]}"  != "-" ]] && _has_total=1
         [[ "${SUMMARY_SCHED[$_i]}"  != "-" ]] && _has_sched=1
         [[ "${SUMMARY_ORCH[$_i]}"   != "-" ]] && _has_orch=1
+        [[ "${SUMMARY_O2_WALL[$_i]}" != "-" ]] && _has_o_split=1
     done
 
     echo ""
@@ -601,6 +736,10 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
     if [[ $_has_total  -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Total (us)");  _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
     if [[ $_has_sched  -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Sched (us)");  _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
     if [[ $_has_orch   -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Orch (us)");   _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
+    if [[ $_has_o_split -eq 1 ]]; then
+        _hdr=$(printf "%s  %12s  %12s  %12s  %12s  %12s  %12s" "$_hdr" "O1 Active" "O1 Drain" "O2 Active" "O2 Wall" "Pipe Enq" "Pipe Flush")
+        _sep=$(printf "%s  %12s  %12s  %12s  %12s  %12s  %12s" "$_sep" "------------" "------------" "------------" "------------" "------------" "------------")
+    fi
     echo "$_hdr"
     echo "$_sep"
 
@@ -611,6 +750,12 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
         if [[ $_has_total  -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_TOTAL[$_i]}");  fi
         if [[ $_has_sched  -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_SCHED[$_i]}");  fi
         if [[ $_has_orch   -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_ORCH[$_i]}");   fi
+        if [[ $_has_o_split -eq 1 ]]; then
+            _row=$(printf "%s  %12s  %12s  %12s  %12s  %12s  %12s" "$_row" \
+                "${SUMMARY_O1_ACTIVE[$_i]}" "${SUMMARY_O1_DRAIN[$_i]}" \
+                "${SUMMARY_O2_ACTIVE[$_i]}" "${SUMMARY_O2_WALL[$_i]}" \
+                "${SUMMARY_PIPE_ENQ[$_i]}" "${SUMMARY_PIPE_FLUSH[$_i]}")
+        fi
         echo "$_row"
     done
 fi

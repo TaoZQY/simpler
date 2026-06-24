@@ -35,18 +35,53 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "common/unified_log.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
+#include "pipeline_strategy.h"
 #include "runtime.h"
 
 // Forward-declared (rather than `#include "dlog_pub.h"`) so this TU does not
 // require CANN's toolchain include path on the host build. Resolved at link
 // time against `libunified_dlog.so` / `libascendalog.so`.
 extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
+
+template <typename T, typename = void>
+struct HasPipelineStrategy : std::false_type {};
+
+template <typename T>
+struct HasPipelineStrategy<T, std::void_t<decltype(std::declval<T &>().pipeline_strategy)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasPipelineDeferSubmitDisabled : std::false_type {};
+
+template <typename T>
+struct HasPipelineDeferSubmitDisabled<T, std::void_t<decltype(std::declval<T &>().pipeline_defer_submit_disabled)>>
+    : std::true_type {};
+
+template <typename T>
+static void set_runtime_pipeline_strategy(T *runtime, int32_t strategy) {
+    if constexpr (HasPipelineStrategy<T>::value) {
+        runtime->pipeline_strategy = strategy;
+    } else {
+        (void)runtime;
+        (void)strategy;
+    }
+}
+
+template <typename T>
+static void set_runtime_pipeline_defer_submit_disabled(T *runtime, bool disabled) {
+    if constexpr (HasPipelineDeferSubmitDisabled<T>::value) {
+        runtime->pipeline_defer_submit_disabled = disabled;
+    } else {
+        (void)runtime;
+        (void)disabled;
+    }
+}
 
 extern "C" {
 
@@ -409,6 +444,15 @@ int run_prepared(
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
             return rc;
+        }
+
+        int32_t pipeline_strategy = resolve_pipeline_strategy_with_env(PIPELINE_STRATEGY_UNSET_BASELINE);
+        bool pipeline_defer_submit_disabled = resolve_pipeline_defer_submit_disabled_with_env();
+        set_runtime_pipeline_strategy(r, pipeline_strategy);
+        set_runtime_pipeline_defer_submit_disabled(r, pipeline_defer_submit_disabled);
+        if (pipeline_strategy == static_cast<int32_t>(PipelineStrategy::S2_O2_SPLIT_CTRL_STRATEGY1) &&
+            aicpu_thread_num < 4) {
+            aicpu_thread_num = 4;
         }
 
         runner->set_l2_swimlane_enabled(enable_l2_swimlane);

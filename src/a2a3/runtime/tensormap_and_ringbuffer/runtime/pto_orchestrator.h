@@ -28,6 +28,8 @@
 #ifndef PTO_ORCHESTRATOR_H
 #define PTO_ORCHESTRATOR_H
 
+#include <atomic>
+
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
@@ -52,6 +54,86 @@ struct PTO2OrchestratorLayout {
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
     int32_t scope_tasks_cap;
     uint64_t scope_stack_capacity;
+};
+
+constexpr int32_t PTO2_SUBMIT_PIPELINE_QUEUE_CAP = 64;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_TASK_BATCH_CAP = 16;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_SCOPE_BATCH_RECORD_CAP = 10;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP = 16;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_MAX_COMMIT_STAGES = 3;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_SCOPE_INLINE_CAP = 64;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_SMALL_SCOPE_BOUNDARY_TASK_CAP = 4;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_SMALL_SCOPE_BOUNDARY_MARKER_FLUSH_CAP = 2;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_EXPLICIT_DEP_CAP = 64;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_HEAP_GUARD_OUTPUT_BYTES = 64 * 1024;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_CONTROL_IDLE = 0;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_CONTROL_WORK = 1;
+constexpr int32_t PTO2_SUBMIT_PIPELINE_CONTROL_STOP = 2;
+
+enum class PTO2SubmitPipelineRecordKind : int32_t {
+    TASK_COMMIT = 0,
+    SCOPE_END = 1,
+    TASK_DEFERRED = 2,
+    TASK_BATCH = 3,
+};
+
+struct PTO2SubmitCommitRecord {
+    PTO2SubmitPipelineRecordKind kind{PTO2SubmitPipelineRecordKind::TASK_COMMIT};
+    PTO2TaskDescriptor *task{nullptr};
+    PTO2TaskPayload *payload{nullptr};
+    PTO2TaskSlotState *slot_state{nullptr};
+    PTO2SchedulerState *scheduler{nullptr};
+    PTO2TaskAllocResult alloc_result{-1, 0, nullptr, nullptr};
+    PTO2TaskId task_id = PTO2TaskId::invalid();
+    PTO2FaninPool *fanin_spill_pool{nullptr};
+    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP]{};
+    int32_t fanin_actual_count{0};
+    int32_t fanin_spill_start{0};
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT]{INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+    PTO2TaskSlotState *scope_task_slot_states[PTO2_SUBMIT_PIPELINE_SCOPE_INLINE_CAP]{};
+    int32_t scope_task_count{0};
+    int32_t scope_task_batch_begin{-1};
+    PTO2TaskId explicit_deps[PTO2_SUBMIT_PIPELINE_EXPLICIT_DEP_CAP]{};
+    int32_t explicit_dep_count{0};
+    int32_t task_batch_slot{-1};
+    int32_t task_batch_count{0};
+    bool in_manual_scope{false};
+    bool needs_tensormap_registration{false};
+};
+
+struct PTO2DeferredSubmitRecord {
+    PTO2TaskPayload *payload{nullptr};
+    PTO2TaskSlotState *slot_state{nullptr};
+    PTO2SchedulerState *scheduler{nullptr};
+    void *packed_buffer_base{nullptr};
+    void *packed_buffer_end{nullptr};
+    PTO2TaskId task_id = PTO2TaskId::invalid();
+    PTO2FaninPool *fanin_spill_pool{nullptr};
+    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP]{};
+    int32_t fanin_actual_count{0};
+    int32_t fanin_spill_start{0};
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT]{INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+    PTO2TaskId explicit_deps[PTO2_SUBMIT_PIPELINE_EXPLICIT_DEP_CAP]{};
+    int32_t explicit_dep_count{0};
+    bool in_manual_scope{false};
+    bool needs_tensormap_registration{false};
+};
+
+struct PTO2SubmitTaskBatchSlot {
+    PTO2SubmitCommitRecord records[PTO2_SUBMIT_PIPELINE_TASK_BATCH_CAP];
+    PTO2DeferredSubmitRecord deferred_records[PTO2_SUBMIT_PIPELINE_TASK_BATCH_CAP];
+    PTO2SchedulerState *scope_scheduler{nullptr};
+    PTO2TaskSlotState *scope_task_slot_states[PTO2_SUBMIT_PIPELINE_SCOPE_INLINE_CAP]{};
+    int32_t count{0};
+    int32_t scope_task_count{0};
+    int32_t small_scope_boundary_marker_count{0};
+};
+
+struct PTO2SubmitPipelineQueue {
+    std::atomic<uint64_t> tail{0};
+    std::atomic<uint64_t> head{0};
+    std::atomic<int32_t> slot_state[PTO2_SUBMIT_PIPELINE_QUEUE_CAP];
+    PTO2SubmitCommitRecord records[PTO2_SUBMIT_PIPELINE_QUEUE_CAP];
 };
 
 // =============================================================================
@@ -91,6 +173,47 @@ struct PTO2OrchestratorState {
     // Note: In simulated mode, orchestrator and scheduler share address space
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState *scheduler;  // For simulated mode only
+
+    // Strategy1 submit pipeline: O0 materializes payload/output tensors and
+    // O1 finishes dependency lookup, TensorMap registration, descriptor writes,
+    // fanin metadata, and wiring queue publication.
+    bool submit_pipeline_enabled{false};
+    bool submit_pipeline_enqueue_submit_records{false};
+    bool submit_pipeline_defer_dependencies{false};
+    bool submit_pipeline_signal_scheduler_drain{false};
+    bool submit_pipeline_compact_deferred_records{false};
+    int32_t submit_pipeline_commit_stages{0};
+    std::atomic<bool> submit_pipeline_stop{false};
+    std::atomic<bool> submit_pipeline_work_available{false};
+    std::atomic<int32_t> submit_pipeline_control{PTO2_SUBMIT_PIPELINE_CONTROL_IDLE};
+    std::atomic<uint64_t> submit_pipeline_completed{0};
+    std::atomic<bool> submit_pipeline_stage_done[PTO2_SUBMIT_PIPELINE_MAX_COMMIT_STAGES];
+    PTO2SubmitPipelineQueue submit_pipeline_queues[PTO2_SUBMIT_PIPELINE_MAX_COMMIT_STAGES];
+    std::atomic<int32_t> submit_pipeline_task_batch_slot_state[PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP];
+    PTO2SubmitTaskBatchSlot submit_pipeline_task_batch_slots[PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP];
+    int32_t submit_pipeline_current_task_batch_slot{-1};
+    int32_t submit_pipeline_task_batch_count{0};
+    int32_t submit_pipeline_next_task_batch_slot{0};
+#if PTO2_PROFILING
+    uint64_t submit_pipeline_task_enqueue_cycles{0};
+    uint64_t submit_pipeline_scope_enqueue_cycles{0};
+    uint64_t submit_pipeline_flush_cycles{0};
+    uint64_t submit_pipeline_batch_sync_cycles{0};
+    uint64_t submit_pipeline_deferred_dep_cycles{0};
+    uint64_t submit_pipeline_deferred_fanin_cycles{0};
+    uint64_t submit_pipeline_publish_cycles{0};
+    uint64_t submit_pipeline_scope_release_cycles{0};
+    uint64_t submit_pipeline_scope_record_cycles{0};
+    uint64_t submit_pipeline_publish_spins{0};
+    uint32_t submit_pipeline_scheduler_drain_hint_count{0};
+    uint32_t submit_pipeline_task_enqueue_count{0};
+    uint32_t submit_pipeline_task_enqueue_batch_count{0};
+    uint32_t submit_pipeline_scope_enqueue_count{0};
+    uint32_t submit_pipeline_flush_count{0};
+    uint32_t submit_pipeline_deferred_commit_count{0};
+    uint32_t submit_pipeline_scope_record_count{0};
+    uint32_t submit_pipeline_compact_deferred_count{0};
+#endif
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
@@ -172,6 +295,15 @@ struct PTO2OrchestratorState {
     void destroy();
     void set_scheduler(PTO2SchedulerState *scheduler);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
+    void enable_submit_pipeline(
+        int32_t orch_thread_num, bool enqueue_submit_records, bool defer_dependencies, bool signal_scheduler_drain,
+        bool compact_deferred_records
+    );
+    void stop_submit_pipeline();
+    uint64_t run_submit_pipeline_worker(int32_t stage_idx);
+    void flush_submit_task_batch();
+    void flush_submit_pipeline();
+    void log_submit_pipeline_diagnostics(int32_t thread_idx) const;
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);

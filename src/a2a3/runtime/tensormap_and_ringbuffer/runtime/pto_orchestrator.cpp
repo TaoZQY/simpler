@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/dep_gen.h"
 #include "common/unified_log.h"
@@ -297,6 +299,894 @@ static bool append_fanin_or_fail(
     return true;
 }
 
+static TensorArgType payload_arg_type(const PTO2TaskPayload &payload, int32_t index) {
+    return static_cast<TensorArgType>((payload.arg_tags_packed >> (index * 4)) & 0xfu);
+}
+
+static void submit_pipeline_queue_reset(PTO2SubmitPipelineQueue &queue) {
+    queue.tail.store(0, std::memory_order_release);
+    queue.head.store(0, std::memory_order_release);
+    for (int32_t i = 0; i < PTO2_SUBMIT_PIPELINE_QUEUE_CAP; i++) {
+        queue.slot_state[i].store(0, std::memory_order_release);
+        queue.records[i] = PTO2SubmitCommitRecord{};
+    }
+}
+
+static void submit_pipeline_queue_push(PTO2SubmitPipelineQueue &queue, const PTO2SubmitCommitRecord &record) {
+    uint64_t seq = queue.tail.load(std::memory_order_acquire);
+    int32_t slot = static_cast<int32_t>(seq % PTO2_SUBMIT_PIPELINE_QUEUE_CAP);
+    while (queue.slot_state[slot].load(std::memory_order_acquire) != 0) {
+        SPIN_WAIT_HINT();
+    }
+    queue.records[slot] = record;
+    queue.slot_state[slot].store(1, std::memory_order_release);
+    queue.tail.store(seq + 1, std::memory_order_release);
+}
+
+static void submit_pipeline_queue_push_task_batch(PTO2SubmitPipelineQueue &queue, int32_t batch_slot, int32_t count) {
+    PTO2SubmitCommitRecord record{};
+    record.kind = PTO2SubmitPipelineRecordKind::TASK_BATCH;
+    record.task_batch_slot = batch_slot;
+    record.task_batch_count = count;
+    submit_pipeline_queue_push(queue, record);
+}
+
+static bool submit_pipeline_queue_pop(PTO2SubmitPipelineQueue &queue, PTO2SubmitCommitRecord *record) {
+    uint64_t seq = queue.head.load(std::memory_order_acquire);
+    uint64_t tail = queue.tail.load(std::memory_order_acquire);
+    if (seq >= tail) {
+        return false;
+    }
+    int32_t slot = static_cast<int32_t>(seq % PTO2_SUBMIT_PIPELINE_QUEUE_CAP);
+    while (queue.slot_state[slot].load(std::memory_order_acquire) != 1) {
+        SPIN_WAIT_HINT();
+    }
+    *record = queue.records[slot];
+    queue.records[slot] = PTO2SubmitCommitRecord{};
+    queue.slot_state[slot].store(0, std::memory_order_release);
+    queue.head.store(seq + 1, std::memory_order_release);
+    return true;
+}
+
+static bool submit_pipeline_queue_empty(PTO2SubmitPipelineQueue &queue) {
+    return queue.head.load(std::memory_order_acquire) >= queue.tail.load(std::memory_order_acquire);
+}
+
+static void mark_submit_pipeline_work_available(PTO2OrchestratorState *orch) {
+    orch->submit_pipeline_work_available.store(true, std::memory_order_release);
+    int32_t expected = PTO2_SUBMIT_PIPELINE_CONTROL_IDLE;
+    orch->submit_pipeline_control.compare_exchange_strong(
+        expected, PTO2_SUBMIT_PIPELINE_CONTROL_WORK, std::memory_order_acq_rel, std::memory_order_acquire
+    );
+}
+
+static void reset_submit_task_batch_slot(PTO2SubmitTaskBatchSlot &batch) {
+    batch.count = 0;
+    batch.scope_scheduler = nullptr;
+    batch.scope_task_count = 0;
+    batch.small_scope_boundary_marker_count = 0;
+}
+
+static int32_t acquire_submit_task_batch_slot(PTO2OrchestratorState *orch) {
+    while (true) {
+        for (int32_t probe = 0; probe < PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP; probe++) {
+            int32_t slot =
+                (orch->submit_pipeline_next_task_batch_slot + probe) % PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP;
+            if (orch->submit_pipeline_task_batch_slot_state[slot].load(std::memory_order_acquire) == 0) {
+                orch->submit_pipeline_task_batch_slot_state[slot].store(1, std::memory_order_release);
+                reset_submit_task_batch_slot(orch->submit_pipeline_task_batch_slots[slot]);
+                orch->submit_pipeline_next_task_batch_slot = (slot + 1) % PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP;
+                return slot;
+            }
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
+static void release_submit_task_batch_slot(PTO2OrchestratorState *orch, int32_t slot) {
+    if (slot < 0 || slot >= PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP) {
+        return;
+    }
+    reset_submit_task_batch_slot(orch->submit_pipeline_task_batch_slots[slot]);
+    orch->submit_pipeline_task_batch_slot_state[slot].store(0, std::memory_order_release);
+}
+
+static int32_t append_submit_task_batch_record_index(PTO2OrchestratorState *orch) {
+    if (orch->submit_pipeline_current_task_batch_slot < 0) {
+        orch->submit_pipeline_current_task_batch_slot = acquire_submit_task_batch_slot(orch);
+        orch->submit_pipeline_task_batch_count = 0;
+    } else if (orch->submit_pipeline_task_batch_count >= PTO2_SUBMIT_PIPELINE_TASK_BATCH_CAP) {
+        orch->flush_submit_task_batch();
+        orch->submit_pipeline_current_task_batch_slot = acquire_submit_task_batch_slot(orch);
+        orch->submit_pipeline_task_batch_count = 0;
+    }
+    PTO2SubmitTaskBatchSlot &batch =
+        orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+    int32_t index = batch.count++;
+    orch->submit_pipeline_task_batch_count = batch.count;
+    return index;
+}
+
+static PTO2SubmitCommitRecord *append_submit_task_batch_record_slot(PTO2OrchestratorState *orch) {
+    int32_t index = append_submit_task_batch_record_index(orch);
+    PTO2SubmitTaskBatchSlot &batch =
+        orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+    return &batch.records[index];
+}
+
+static PTO2DeferredSubmitRecord *append_deferred_submit_task_batch_record_slot(PTO2OrchestratorState *orch) {
+    int32_t index = append_submit_task_batch_record_index(orch);
+    PTO2SubmitTaskBatchSlot &batch =
+        orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+    batch.records[index].kind = PTO2SubmitPipelineRecordKind::TASK_DEFERRED;
+#if PTO2_PROFILING
+    orch->submit_pipeline_compact_deferred_count++;
+#endif
+    return &batch.deferred_records[index];
+}
+
+static void append_submit_task_batch_record(PTO2OrchestratorState *orch, const PTO2SubmitCommitRecord &record) {
+    *append_submit_task_batch_record_slot(orch) = record;
+}
+
+static int32_t find_scope_tail_task_segment(
+    PTO2SubmitTaskBatchSlot &batch, PTO2TaskSlotState **task_slot_states, int32_t count,
+    bool compact_deferred_records
+) {
+    int32_t begin = batch.count - count;
+    if (count <= 0 || count > PTO2_SUBMIT_PIPELINE_SMALL_SCOPE_BOUNDARY_TASK_CAP || begin < 0) {
+        return -1;
+    }
+    for (int32_t i = 0; i < count; i++) {
+        PTO2SubmitCommitRecord &record = batch.records[begin + i];
+        PTO2TaskSlotState *slot_state =
+            compact_deferred_records ? batch.deferred_records[begin + i].slot_state : record.slot_state;
+        if (record.kind != PTO2SubmitPipelineRecordKind::TASK_DEFERRED || slot_state != task_slot_states[i]) {
+            return -1;
+        }
+    }
+    return begin;
+}
+
+static bool append_scope_end_to_task_batch_slot(
+    PTO2OrchestratorState *orch, PTO2TaskSlotState **task_slot_states, int32_t count
+) {
+    if (count > PTO2_SUBMIT_PIPELINE_SCOPE_INLINE_CAP) {
+        return false;
+    }
+    int32_t scope_task_batch_begin = -1;
+    if (orch->submit_pipeline_current_task_batch_slot >= 0 &&
+        orch->submit_pipeline_task_batch_count < PTO2_SUBMIT_PIPELINE_TASK_BATCH_CAP) {
+        PTO2SubmitTaskBatchSlot &batch =
+            orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+        scope_task_batch_begin =
+            find_scope_tail_task_segment(batch, task_slot_states, count, orch->submit_pipeline_compact_deferred_records);
+    }
+    PTO2SubmitCommitRecord &record = *append_submit_task_batch_record_slot(orch);
+    record.kind = PTO2SubmitPipelineRecordKind::SCOPE_END;
+    record.scheduler = orch->scheduler;
+    record.scope_task_count = count;
+    record.scope_task_batch_begin = scope_task_batch_begin;
+    if (scope_task_batch_begin < 0) {
+        for (int32_t i = 0; i < count; i++) {
+            record.scope_task_slot_states[i] = task_slot_states[i];
+        }
+    } else {
+        PTO2SubmitTaskBatchSlot &batch =
+            orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+        batch.small_scope_boundary_marker_count++;
+    }
+    PTO2SubmitTaskBatchSlot &batch =
+        orch->submit_pipeline_task_batch_slots[orch->submit_pipeline_current_task_batch_slot];
+    if (batch.small_scope_boundary_marker_count >= PTO2_SUBMIT_PIPELINE_SMALL_SCOPE_BOUNDARY_MARKER_FLUSH_CAP ||
+        orch->submit_pipeline_task_batch_count >= PTO2_SUBMIT_PIPELINE_SCOPE_BATCH_RECORD_CAP) {
+        orch->flush_submit_task_batch();
+    }
+    return true;
+}
+
+static void write_submit_descriptor(
+    PTO2TaskDescriptor &task, PTO2TaskId task_id, void *packed_buffer_base, void *packed_buffer_end,
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+) {
+    task.task_id = task_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    task.packed_buffer_base = packed_buffer_base;
+    task.packed_buffer_end = packed_buffer_end;
+}
+
+template <typename Emit>
+static bool compute_payload_task_fanin(
+    const PTO2TaskPayload &payload, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit
+) {
+    if (in_manual_scope) {
+        return true;
+    }
+
+    for (int32_t i = 0; i < payload.tensor_count; i++) {
+        TensorArgType ptype = payload_arg_type(payload, i);
+        if (ptype == TensorArgType::OUTPUT) {
+            continue;
+        }
+
+        const Tensor *tensor = &payload.tensors[i];
+        PTO2TaskId owner = tensor->owner_task_id;
+        if (owner.is_valid() && !emit(owner)) {
+            return false;
+        }
+
+        if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
+            continue;
+        }
+        if (tensor->manual_dep) {
+            continue;
+        }
+
+        bool fatal = false;
+        tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
+            if (!emit(entry.producer_task_id)) {
+                fatal = true;
+                return false;
+            }
+            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                tensor_map.remove_entry(entry);
+            }
+            return true;
+        });
+        if (fatal) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void register_payload_task_outputs(
+    const PTO2TaskPayload &payload, PTO2TaskId task_id, PTO2TensorMap &tensor_map, bool in_manual_scope
+) {
+    if (in_manual_scope) {
+        return;
+    }
+    for (int32_t i = 0; i < payload.tensor_count; i++) {
+        TensorArgType ptype = payload_arg_type(payload, i);
+        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+            const Tensor *tensor = &payload.tensors[i];
+            if (!tensor->manual_dep) {
+                tensor_map.insert(*tensor, task_id);
+            }
+        }
+    }
+}
+
+static void commit_submit_descriptor(PTO2SubmitCommitRecord &record) {
+    write_submit_descriptor(
+        *record.task, record.task_id, record.alloc_result.packed_base, record.alloc_result.packed_end,
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)],
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)],
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)]
+    );
+}
+
+template <typename SubmitRecord>
+static void commit_submit_fanin(SubmitRecord &record) {
+    PTO2TaskPayload &payload = *record.payload;
+    if (record.fanin_actual_count <= 0) {
+        payload.fanin_actual_count = 0;
+        payload.fanin_spill_start = 0;
+        payload.fanin_spill_pool = record.fanin_spill_pool;
+        return;
+    }
+
+    for_each_fanin_storage(
+        record.fanin_inline_slot_states, record.fanin_actual_count, record.fanin_spill_start,
+        *record.fanin_spill_pool,
+        [](PTO2TaskSlotState *producer) {
+            producer->fanout_count++;
+        }
+    );
+
+    int32_t inline_count = std::min(record.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
+    payload.fanin_actual_count = record.fanin_actual_count;
+    payload.fanin_spill_start = record.fanin_spill_start;
+    payload.fanin_spill_pool = record.fanin_spill_pool;
+    for (int32_t i = 0; i < inline_count; i++) {
+        payload.fanin_inline_slot_states[i] = record.fanin_inline_slot_states[i];
+    }
+}
+
+template <typename SubmitRecord>
+static uint64_t commit_submit_publish(SubmitRecord &record) {
+    uint64_t spin_count = 0;
+    while (!record.scheduler->wiring.queue.push(record.slot_state)) {
+        spin_count++;
+        SPIN_WAIT_HINT();
+    }
+    return spin_count;
+}
+
+template <typename SubmitRecord>
+static void signal_scheduler_drain_if_needed(PTO2OrchestratorState *orch, SubmitRecord &record) {
+    if (!orch->submit_pipeline_signal_scheduler_drain || record.scheduler == nullptr) {
+        return;
+    }
+    record.scheduler->wiring.orch_drain_hint_seq.fetch_add(1, std::memory_order_release);
+#if PTO2_PROFILING
+    orch->submit_pipeline_scheduler_drain_hint_count++;
+#endif
+}
+
+static void commit_submit_record(PTO2SubmitCommitRecord &record) {
+    commit_submit_descriptor(record);
+    commit_submit_fanin(record);
+    commit_submit_publish(record);
+}
+
+static void commit_deferred_descriptor(PTO2SubmitCommitRecord &record) {
+    if (record.task == nullptr) {
+        return;
+    }
+    commit_submit_descriptor(record);
+}
+
+static void commit_deferred_descriptor(PTO2DeferredSubmitRecord &record) {
+    write_submit_descriptor(
+        *record.slot_state->task, record.task_id, record.packed_buffer_base, record.packed_buffer_end,
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)],
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)],
+        record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)]
+    );
+}
+
+template <typename SubmitRecord>
+static bool compute_deferred_submit_dependencies(
+    PTO2OrchestratorState *orch, SubmitRecord &record, bool sync_tensormap
+) {
+    uint8_t ring_id = record.task_id.ring();
+    if (sync_tensormap) {
+        PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        orch->tensor_map.sync_tensormap(record.task_id, sm_last_task_alive);
+    }
+
+    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
+    for (int32_t i = 0; i < record.explicit_dep_count; i++) {
+        PTO2TaskId dep_task_id = record.explicit_deps[i];
+        if (!dep_task_id.is_valid()) {
+            orch->report_fatal(
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
+            return false;
+        }
+        uint8_t dep_ring_id = dep_task_id.ring();
+        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
+        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
+        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
+        if (dep_local_task_id < dep_last_task_alive) {
+            continue;
+        }
+        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
+        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+        if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, &fanin_builder, ring_id)) {
+            return false;
+        }
+    }
+
+    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
+        uint8_t prod_ring = producer_task_id.ring();
+        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
+        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+        PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
+        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, &fanin_builder, ring_id);
+    };
+
+    if (!compute_payload_task_fanin(*record.payload, orch->tensor_map, record.in_manual_scope, runtime_emit)) {
+        return false;
+    }
+    if (record.needs_tensormap_registration) {
+        register_payload_task_outputs(*record.payload, record.task_id, orch->tensor_map, record.in_manual_scope);
+    }
+
+    record.fanin_actual_count = fanin_builder.count;
+    record.fanin_spill_start = fanin_builder.spill_start;
+    record.fanin_spill_pool = &fanin_builder.spill_pool;
+    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
+    for (int32_t i = 0; i < inline_count; i++) {
+        record.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+    }
+    return true;
+}
+
+template <typename SubmitRecord>
+static void commit_deferred_submit_record(
+    PTO2OrchestratorState *orch, SubmitRecord &record, bool sync_tensormap = true
+) {
+    if (record.slot_state == nullptr || record.payload == nullptr || record.scheduler == nullptr) {
+        return;
+    }
+    commit_deferred_descriptor(record);
+#if PTO2_PROFILING
+    uint64_t dep_start = get_sys_cnt_aicpu();
+#endif
+    if (!compute_deferred_submit_dependencies(orch, record, sync_tensormap)) {
+        return;
+    }
+#if PTO2_PROFILING
+    uint64_t dep_end = get_sys_cnt_aicpu();
+    orch->submit_pipeline_deferred_dep_cycles += dep_end - dep_start;
+    uint64_t fanin_start = dep_end;
+#endif
+    commit_submit_fanin(record);
+#if PTO2_PROFILING
+    uint64_t fanin_end = get_sys_cnt_aicpu();
+    orch->submit_pipeline_deferred_fanin_cycles += fanin_end - fanin_start;
+    uint64_t publish_start = fanin_end;
+#endif
+    uint64_t publish_spins = record.fanin_actual_count == 0
+                                  ? record.scheduler->publish_ready_no_fanin(record.slot_state)
+                                  : commit_submit_publish(record);
+    if (record.fanin_actual_count != 0) {
+        signal_scheduler_drain_if_needed(orch, record);
+    }
+#if PTO2_PROFILING
+    uint64_t publish_end = get_sys_cnt_aicpu();
+    orch->submit_pipeline_publish_cycles += publish_end - publish_start;
+    orch->submit_pipeline_publish_spins += publish_spins;
+    orch->submit_pipeline_deferred_commit_count++;
+#else
+    (void)publish_spins;
+#endif
+}
+
+static void commit_scope_end_record(PTO2SubmitCommitRecord &record) {
+    if (record.scheduler != nullptr && record.scope_task_count > 0) {
+        record.scheduler->on_scope_end(record.scope_task_slot_states, record.scope_task_count);
+    }
+}
+
+static void commit_scope_end_record_from_task_segment(
+    PTO2OrchestratorState *orch, PTO2SubmitTaskBatchSlot &batch, PTO2SubmitCommitRecord &record
+) {
+    if (record.scheduler == nullptr || record.scope_task_count <= 0 || record.scope_task_batch_begin < 0) {
+        commit_scope_end_record(record);
+        return;
+    }
+    int32_t begin = record.scope_task_batch_begin;
+    int32_t end = begin + record.scope_task_count;
+    if (begin < 0 || end > batch.count) {
+        commit_scope_end_record(record);
+        return;
+    }
+    for (int32_t i = 0; i < record.scope_task_count; i++) {
+        PTO2SubmitCommitRecord &task_record = batch.records[begin + i];
+        PTO2TaskSlotState *slot_state = orch->submit_pipeline_compact_deferred_records
+                                            ? batch.deferred_records[begin + i].slot_state
+                                            : task_record.slot_state;
+        if (task_record.kind != PTO2SubmitPipelineRecordKind::TASK_DEFERRED || slot_state == nullptr) {
+            commit_scope_end_record(record);
+            return;
+        }
+    }
+    PTO2TaskSlotState *slot_states[PTO2_SUBMIT_PIPELINE_SMALL_SCOPE_BOUNDARY_TASK_CAP];
+    for (int32_t i = begin; i < end; i++) {
+        slot_states[i - begin] = orch->submit_pipeline_compact_deferred_records ? batch.deferred_records[i].slot_state
+                                                                                : batch.records[i].slot_state;
+    }
+    record.scheduler->release_producers(slot_states, record.scope_task_count);
+}
+
+static void sync_deferred_submit_task_batch(
+    PTO2OrchestratorState *orch, PTO2SubmitTaskBatchSlot &batch, int32_t begin, int32_t end
+) {
+    bool ring_seen[PTO2_MAX_RING_DEPTH] = {};
+    for (int32_t i = begin; i < end; i++) {
+        PTO2SubmitCommitRecord &record = batch.records[i];
+        if (record.kind != PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+            continue;
+        }
+        PTO2TaskId task_id =
+            orch->submit_pipeline_compact_deferred_records ? batch.deferred_records[i].task_id : record.task_id;
+        ring_seen[task_id.ring()] = true;
+    }
+
+    for (int32_t ring_id = 0; ring_id < PTO2_MAX_RING_DEPTH; ring_id++) {
+        if (!ring_seen[ring_id]) {
+            continue;
+        }
+        PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        orch->tensor_map.sync_validity(ring_id, sm_last_task_alive);
+
+        bool needs_cleanup =
+            sm_last_task_alive - orch->tensor_map.last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL;
+        if (!needs_cleanup) {
+            uint32_t cleanup_slot = orch->tensor_map.get_task_local_id_slot(
+                static_cast<uint8_t>(ring_id), static_cast<uint32_t>(orch->tensor_map.last_cleanup[ring_id])
+            );
+            for (int32_t i = begin; i < end; i++) {
+                PTO2SubmitCommitRecord &record = batch.records[i];
+                if (record.kind != PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+                    continue;
+                }
+                PTO2TaskId task_id = orch->submit_pipeline_compact_deferred_records
+                                          ? batch.deferred_records[i].task_id
+                                          : record.task_id;
+                if (task_id.ring() != ring_id) {
+                    continue;
+                }
+                if (orch->tensor_map.get_task_local_id_slot(static_cast<uint8_t>(ring_id), task_id.local()) ==
+                    cleanup_slot) {
+                    needs_cleanup = true;
+                    break;
+                }
+            }
+        }
+        if (needs_cleanup) {
+            orch->tensor_map.cleanup_retired(ring_id, orch->tensor_map.last_cleanup[ring_id], sm_last_task_alive);
+            orch->tensor_map.last_cleanup[ring_id] = sm_last_task_alive;
+        }
+    }
+}
+
+static void commit_submit_pipeline_task_record(
+    PTO2OrchestratorState *orch, PTO2SubmitCommitRecord &record, bool sync_tensormap = true
+) {
+    if (record.kind == PTO2SubmitPipelineRecordKind::SCOPE_END) {
+        commit_scope_end_record(record);
+    } else if (record.kind == PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+        commit_deferred_submit_record(orch, record, sync_tensormap);
+    } else {
+        commit_submit_record(record);
+    }
+}
+
+static int32_t count_submit_task_records(PTO2SubmitTaskBatchSlot &batch, int32_t count) {
+    int32_t task_count = 0;
+    for (int32_t i = 0; i < count; i++) {
+        PTO2SubmitPipelineRecordKind kind = batch.records[i].kind;
+        if (kind == PTO2SubmitPipelineRecordKind::TASK_COMMIT || kind == PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+            task_count++;
+        }
+    }
+    return task_count;
+}
+
+static void commit_submit_task_batch_record(PTO2OrchestratorState *orch, PTO2SubmitCommitRecord &record) {
+    int32_t slot = record.task_batch_slot;
+    if (slot < 0 || slot >= PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP) {
+        return;
+    }
+    PTO2SubmitTaskBatchSlot &batch = orch->submit_pipeline_task_batch_slots[slot];
+    int32_t count = batch.count;
+    if (record.task_batch_count > 0 && record.task_batch_count < count) {
+        count = record.task_batch_count;
+    }
+    int32_t begin = 0;
+    while (begin < count) {
+        if (batch.records[begin].kind == PTO2SubmitPipelineRecordKind::SCOPE_END) {
+#if PTO2_PROFILING
+            uint64_t scope_start = get_sys_cnt_aicpu();
+#endif
+            commit_scope_end_record_from_task_segment(orch, batch, batch.records[begin]);
+#if PTO2_PROFILING
+            uint64_t scope_cycles = get_sys_cnt_aicpu() - scope_start;
+            orch->submit_pipeline_scope_release_cycles += scope_cycles;
+            orch->submit_pipeline_scope_record_cycles += scope_cycles;
+            orch->submit_pipeline_scope_record_count++;
+#endif
+            begin++;
+            continue;
+        }
+
+        int32_t end = begin;
+        while (end < count && batch.records[end].kind != PTO2SubmitPipelineRecordKind::SCOPE_END) {
+            end++;
+        }
+#if PTO2_PROFILING
+        uint64_t sync_start = get_sys_cnt_aicpu();
+#endif
+        sync_deferred_submit_task_batch(orch, batch, begin, end);
+#if PTO2_PROFILING
+        orch->submit_pipeline_batch_sync_cycles += get_sys_cnt_aicpu() - sync_start;
+#endif
+        for (int32_t i = begin; i < end; i++) {
+            if (orch->submit_pipeline_compact_deferred_records &&
+                batch.records[i].kind == PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+                commit_deferred_submit_record(orch, batch.deferred_records[i], false);
+            } else {
+                commit_submit_pipeline_task_record(orch, batch.records[i], false);
+            }
+        }
+        begin = end;
+    }
+    if (batch.scope_scheduler != nullptr && batch.scope_task_count > 0) {
+#if PTO2_PROFILING
+        uint64_t scope_start = get_sys_cnt_aicpu();
+#endif
+        batch.scope_scheduler->on_scope_end(batch.scope_task_slot_states, batch.scope_task_count);
+#if PTO2_PROFILING
+        orch->submit_pipeline_scope_release_cycles += get_sys_cnt_aicpu() - scope_start;
+#endif
+    }
+    release_submit_task_batch_slot(orch, slot);
+}
+
+static bool commit_single_deferred_task_batch_inline(PTO2OrchestratorState *orch, int32_t slot, int32_t count) {
+    if (orch->submit_pipeline_commit_stages != 1 || !orch->submit_pipeline_defer_dependencies || count <= 0 ||
+        count > 2) {
+        return false;
+    }
+
+    PTO2SubmitTaskBatchSlot &batch = orch->submit_pipeline_task_batch_slots[slot];
+    int32_t deferred_task_count = 0;
+    for (int32_t i = 0; i < count; i++) {
+        PTO2SubmitPipelineRecordKind kind = batch.records[i].kind;
+        if (kind == PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+            deferred_task_count++;
+        } else if (kind != PTO2SubmitPipelineRecordKind::SCOPE_END) {
+            return false;
+        }
+    }
+    if (deferred_task_count != 1) {
+        return false;
+    }
+
+    PTO2SubmitCommitRecord record{};
+    record.kind = PTO2SubmitPipelineRecordKind::TASK_BATCH;
+    record.task_batch_slot = slot;
+    record.task_batch_count = count;
+    commit_submit_task_batch_record(orch, record);
+    return true;
+}
+
+void PTO2OrchestratorState::enable_submit_pipeline(
+    int32_t orch_thread_num, bool enqueue_submit_records, bool defer_dependencies, bool signal_scheduler_drain,
+    bool compact_deferred_records
+) {
+    submit_pipeline_commit_stages = 0;
+    if (orch_thread_num >= 4) {
+        submit_pipeline_commit_stages = 3;
+    } else if (orch_thread_num >= 2) {
+        submit_pipeline_commit_stages = 1;
+    }
+    submit_pipeline_enabled = submit_pipeline_commit_stages > 0;
+    submit_pipeline_enqueue_submit_records = submit_pipeline_enabled && enqueue_submit_records;
+    submit_pipeline_defer_dependencies =
+        submit_pipeline_enabled && submit_pipeline_commit_stages == 1 && defer_dependencies;
+    submit_pipeline_signal_scheduler_drain =
+        submit_pipeline_defer_dependencies && signal_scheduler_drain && scheduler != nullptr;
+    submit_pipeline_compact_deferred_records = submit_pipeline_defer_dependencies && compact_deferred_records;
+    submit_pipeline_current_task_batch_slot = -1;
+    submit_pipeline_task_batch_count = 0;
+    submit_pipeline_next_task_batch_slot = 0;
+    submit_pipeline_stop.store(false, std::memory_order_release);
+    submit_pipeline_work_available.store(false, std::memory_order_release);
+    submit_pipeline_control.store(PTO2_SUBMIT_PIPELINE_CONTROL_IDLE, std::memory_order_release);
+    submit_pipeline_completed.store(0, std::memory_order_release);
+#if PTO2_PROFILING
+    submit_pipeline_task_enqueue_cycles = 0;
+    submit_pipeline_scope_enqueue_cycles = 0;
+    submit_pipeline_flush_cycles = 0;
+    submit_pipeline_batch_sync_cycles = 0;
+    submit_pipeline_deferred_dep_cycles = 0;
+    submit_pipeline_deferred_fanin_cycles = 0;
+    submit_pipeline_publish_cycles = 0;
+    submit_pipeline_scope_release_cycles = 0;
+    submit_pipeline_scope_record_cycles = 0;
+    submit_pipeline_publish_spins = 0;
+    submit_pipeline_scheduler_drain_hint_count = 0;
+    submit_pipeline_task_enqueue_count = 0;
+    submit_pipeline_task_enqueue_batch_count = 0;
+    submit_pipeline_scope_enqueue_count = 0;
+    submit_pipeline_flush_count = 0;
+    submit_pipeline_deferred_commit_count = 0;
+    submit_pipeline_scope_record_count = 0;
+    submit_pipeline_compact_deferred_count = 0;
+#endif
+    for (int32_t stage = 0; stage < PTO2_SUBMIT_PIPELINE_MAX_COMMIT_STAGES; stage++) {
+        submit_pipeline_stage_done[stage].store(false, std::memory_order_release);
+        submit_pipeline_queue_reset(submit_pipeline_queues[stage]);
+    }
+    for (int32_t i = 0; i < PTO2_SUBMIT_PIPELINE_TASK_BATCH_SLOT_CAP; i++) {
+        submit_pipeline_task_batch_slot_state[i].store(0, std::memory_order_release);
+        reset_submit_task_batch_slot(submit_pipeline_task_batch_slots[i]);
+    }
+}
+
+uint64_t PTO2OrchestratorState::run_submit_pipeline_worker(int32_t stage_idx) {
+    uint64_t committed = 0;
+    if (!submit_pipeline_enabled || stage_idx < 1 || stage_idx > submit_pipeline_commit_stages) {
+        while (!submit_pipeline_stop.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+        return committed;
+    }
+
+    int32_t commit_stage = stage_idx - 1;
+    PTO2SubmitPipelineQueue &input_queue = submit_pipeline_queues[commit_stage];
+    if (commit_stage == 0) {
+        while (submit_pipeline_control.load(std::memory_order_acquire) == PTO2_SUBMIT_PIPELINE_CONTROL_IDLE) {
+            SPIN_WAIT_HINT();
+        }
+        if (submit_pipeline_control.load(std::memory_order_acquire) == PTO2_SUBMIT_PIPELINE_CONTROL_STOP &&
+            submit_pipeline_queues[0].tail.load(std::memory_order_acquire) == 0) {
+            submit_pipeline_stage_done[commit_stage].store(true, std::memory_order_release);
+            return committed;
+        }
+        while (!submit_pipeline_work_available.load(std::memory_order_acquire)) {
+            if (submit_pipeline_stop.load(std::memory_order_acquire) ||
+                submit_pipeline_control.load(std::memory_order_acquire) == PTO2_SUBMIT_PIPELINE_CONTROL_STOP) {
+                submit_pipeline_stage_done[commit_stage].store(true, std::memory_order_release);
+                return committed;
+            }
+            SPIN_WAIT_HINT();
+        }
+    }
+
+    while (true) {
+        PTO2SubmitCommitRecord record{};
+        if (submit_pipeline_queue_pop(input_queue, &record)) {
+            if (submit_pipeline_commit_stages == 1) {
+                if (record.kind == PTO2SubmitPipelineRecordKind::SCOPE_END) {
+                    commit_scope_end_record(record);
+                } else if (record.kind == PTO2SubmitPipelineRecordKind::TASK_BATCH) {
+                    commit_submit_task_batch_record(this, record);
+                } else if (record.kind == PTO2SubmitPipelineRecordKind::TASK_DEFERRED) {
+                    commit_deferred_submit_record(this, record);
+                } else {
+                    commit_submit_record(record);
+                }
+            } else if (record.kind == PTO2SubmitPipelineRecordKind::SCOPE_END) {
+                commit_scope_end_record(record);
+            } else if (commit_stage == 0) {
+                commit_submit_descriptor(record);
+                submit_pipeline_queue_push(submit_pipeline_queues[1], record);
+            } else if (commit_stage == 1) {
+                commit_submit_fanin(record);
+                submit_pipeline_queue_push(submit_pipeline_queues[2], record);
+            } else {
+                commit_submit_publish(record);
+                signal_scheduler_drain_if_needed(this, record);
+            }
+            submit_pipeline_completed.fetch_add(1, std::memory_order_acq_rel);
+            committed++;
+            continue;
+        }
+        bool upstream_done = commit_stage == 0
+                                 ? submit_pipeline_stop.load(std::memory_order_acquire)
+                                 : submit_pipeline_stage_done[commit_stage - 1].load(std::memory_order_acquire);
+        if (upstream_done && submit_pipeline_queue_empty(input_queue)) {
+            submit_pipeline_stage_done[commit_stage].store(true, std::memory_order_release);
+            return committed;
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
+void PTO2OrchestratorState::flush_submit_task_batch() {
+    if (!submit_pipeline_enabled || submit_pipeline_current_task_batch_slot < 0) {
+        return;
+    }
+    int32_t slot = submit_pipeline_current_task_batch_slot;
+    int32_t count = submit_pipeline_task_batch_count;
+    bool has_scope_end = submit_pipeline_task_batch_slots[slot].scope_scheduler != nullptr &&
+                         submit_pipeline_task_batch_slots[slot].scope_task_count > 0;
+    if (count <= 0 && !has_scope_end) {
+        release_submit_task_batch_slot(this, slot);
+        submit_pipeline_current_task_batch_slot = -1;
+        submit_pipeline_task_batch_count = 0;
+        return;
+    }
+    submit_pipeline_task_batch_slots[slot].count = count;
+    if (commit_single_deferred_task_batch_inline(this, slot, count)) {
+        submit_pipeline_current_task_batch_slot = -1;
+        submit_pipeline_task_batch_count = 0;
+        return;
+    }
+#if PTO2_PROFILING
+    uint64_t enqueue_start = get_sys_cnt_aicpu();
+    int32_t task_count = count_submit_task_records(submit_pipeline_task_batch_slots[slot], count);
+#endif
+    mark_submit_pipeline_work_available(this);
+    submit_pipeline_queue_push_task_batch(submit_pipeline_queues[0], slot, count);
+#if PTO2_PROFILING
+    submit_pipeline_task_enqueue_cycles += get_sys_cnt_aicpu() - enqueue_start;
+    submit_pipeline_task_enqueue_count += static_cast<uint32_t>(task_count);
+    submit_pipeline_task_enqueue_batch_count++;
+#endif
+    submit_pipeline_current_task_batch_slot = -1;
+    submit_pipeline_task_batch_count = 0;
+}
+
+void PTO2OrchestratorState::flush_submit_pipeline() {
+    if (!submit_pipeline_enabled) {
+        return;
+    }
+    flush_submit_task_batch();
+    uint64_t target = submit_pipeline_queues[0].tail.load(std::memory_order_acquire);
+    if (submit_pipeline_completed.load(std::memory_order_acquire) >= target) {
+        return;
+    }
+#if PTO2_PROFILING
+    uint64_t flush_start = get_sys_cnt_aicpu();
+#endif
+    while (submit_pipeline_completed.load(std::memory_order_acquire) < target) {
+        SPIN_WAIT_HINT();
+    }
+#if PTO2_PROFILING
+    submit_pipeline_flush_cycles += get_sys_cnt_aicpu() - flush_start;
+    submit_pipeline_flush_count++;
+#endif
+}
+
+void PTO2OrchestratorState::log_submit_pipeline_diagnostics(int32_t thread_idx) const {
+#if PTO2_PROFILING
+    LOG_INFO_V9(
+        "Thread %d: orch_pipeline_diag task_enq_count=%u task_enq_batches=%u task_enq_cost=%.3fus "
+        "scope_enq_count=%u scope_enq_cost=%.3fus flush_count=%u flush_cost=%.3fus "
+        "batch_sync_cost=%.3fus deferred_dep_cost=%.3fus deferred_fanin_cost=%.3fus publish_cost=%.3fus "
+        "scope_release_cost=%.3fus scope_record_cost=%.3fus deferred_commit_count=%u scope_record_count=%u "
+        "drain_hints=%u compact_deferred=%u publish_spins=%" PRIu64,
+        thread_idx, submit_pipeline_task_enqueue_count, submit_pipeline_task_enqueue_batch_count,
+        cycles_to_us(submit_pipeline_task_enqueue_cycles), submit_pipeline_scope_enqueue_count,
+        cycles_to_us(submit_pipeline_scope_enqueue_cycles), submit_pipeline_flush_count,
+        cycles_to_us(submit_pipeline_flush_cycles), cycles_to_us(submit_pipeline_batch_sync_cycles),
+        cycles_to_us(submit_pipeline_deferred_dep_cycles), cycles_to_us(submit_pipeline_deferred_fanin_cycles),
+        cycles_to_us(submit_pipeline_publish_cycles), cycles_to_us(submit_pipeline_scope_release_cycles),
+        cycles_to_us(submit_pipeline_scope_record_cycles), submit_pipeline_deferred_commit_count,
+        submit_pipeline_scope_record_count, submit_pipeline_scheduler_drain_hint_count,
+        submit_pipeline_compact_deferred_count, static_cast<uint64_t>(submit_pipeline_publish_spins)
+    );
+#else
+    (void)thread_idx;
+#endif
+}
+
+void PTO2OrchestratorState::stop_submit_pipeline() {
+    if (!submit_pipeline_enabled) {
+        submit_pipeline_stop.store(true, std::memory_order_release);
+        submit_pipeline_control.store(PTO2_SUBMIT_PIPELINE_CONTROL_STOP, std::memory_order_release);
+        return;
+    }
+    flush_submit_pipeline();
+    submit_pipeline_stop.store(true, std::memory_order_release);
+    if (!submit_pipeline_work_available.load(std::memory_order_acquire)) {
+        submit_pipeline_control.store(PTO2_SUBMIT_PIPELINE_CONTROL_STOP, std::memory_order_release);
+    }
+}
+
+static bool enqueue_scope_end_record_if_supported(
+    PTO2OrchestratorState *orch, PTO2TaskSlotState **task_slot_states, int32_t count
+) {
+    if (!orch->submit_pipeline_enabled || orch->submit_pipeline_commit_stages != 1 ||
+        count > PTO2_SUBMIT_PIPELINE_SCOPE_INLINE_CAP) {
+        return false;
+    }
+
+    if (append_scope_end_to_task_batch_slot(orch, task_slot_states, count)) {
+        return true;
+    }
+
+    PTO2SubmitCommitRecord record{};
+    record.kind = PTO2SubmitPipelineRecordKind::SCOPE_END;
+    record.scheduler = orch->scheduler;
+    record.scope_task_count = count;
+    for (int32_t i = 0; i < count; i++) {
+        record.scope_task_slot_states[i] = task_slot_states[i];
+    }
+    orch->flush_submit_task_batch();
+#if PTO2_PROFILING
+    uint64_t enqueue_start = get_sys_cnt_aicpu();
+#endif
+    mark_submit_pipeline_work_available(orch);
+    submit_pipeline_queue_push(orch->submit_pipeline_queues[0], record);
+#if PTO2_PROFILING
+    orch->submit_pipeline_scope_enqueue_cycles += get_sys_cnt_aicpu() - enqueue_start;
+    orch->submit_pipeline_scope_enqueue_count++;
+#endif
+    return true;
+}
+
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 
 struct PTO2PreparedTask {
@@ -310,7 +1200,11 @@ struct PTO2PreparedTask {
 static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     PTO2OutputLayout layout;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) {
+        TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+            layout.needs_tensormap_registration = true;
+        }
+        if (tag != TensorArgType::OUTPUT) {
             continue;
         }
         layout.offsets[i] = layout.total_output_size;
@@ -363,6 +1257,11 @@ static bool prepare_task(
 
     if (!check_scope_can_accept_task(orch, allocator, ring_id)) {
         return false;
+    }
+
+    if (orch->submit_pipeline_defer_dependencies && total_output_size > 0 &&
+        allocator.allocation_would_block_on_heap(total_output_size)) {
+        orch->flush_submit_pipeline();
     }
 
     out->alloc_result = allocator.alloc(total_output_size);
@@ -507,7 +1406,14 @@ void PTO2OrchestratorState::end_scope() {
         orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     }
 
+    bool scope_end_queued = false;
     if (orch->scheduler && count > 0) {
+        scope_end_queued = enqueue_scope_end_record_if_supported(orch, &orch->scope_tasks[begin], count);
+    }
+    if (!scope_end_queued) {
+        orch->flush_submit_pipeline();
+    }
+    if (!scope_end_queued && orch->scheduler && count > 0) {
         orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
     }
 
@@ -536,6 +1442,19 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_START();
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
+    bool heap_guard_sync = orch->submit_pipeline_defer_dependencies &&
+                           layout.total_output_size >= PTO2_SUBMIT_PIPELINE_HEAP_GUARD_OUTPUT_BYTES;
+    if (heap_guard_sync) {
+        uint8_t guard_ring_id = orch->current_ring_id();
+        auto &allocator = orch->rings[guard_ring_id].task_allocator;
+        heap_guard_sync = allocator.allocation_would_block_on_heap(layout.total_output_size);
+    }
+    if (heap_guard_sync) {
+        orch->flush_submit_pipeline();
+        uint8_t guard_ring_id = orch->current_ring_id();
+        auto &allocator = orch->rings[guard_ring_id].task_allocator;
+        heap_guard_sync = allocator.allocation_would_block_on_heap(layout.total_output_size);
+    }
     PTO2PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
         return result;
@@ -548,6 +1467,11 @@ static TaskOutputTensors submit_task_common(
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
+    bool defer_dependencies = orch->submit_pipeline_defer_dependencies && !heap_guard_sync;
+    if (defer_dependencies && args.explicit_dep_count() > PTO2_SUBMIT_PIPELINE_EXPLICIT_DEP_CAP) {
+        orch->flush_submit_pipeline();
+        defer_dependencies = false;
+    }
 
     // dep_gen capture point: snapshot the orch submit_task inputs while the
     // tensormap is still in its pre-lookup state for this task. Replay reads
@@ -583,8 +1507,6 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
-
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
 #if PTO2_PROFILING
@@ -594,88 +1516,92 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    // === STEP 2: Sync TensorMap validity and optional cleanup ===
-    // Read current last_task_alive from shared memory for this ring
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    if (!defer_dependencies) {
+        PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
 
-    orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
+        // === STEP 2: Sync TensorMap validity and optional cleanup ===
+        // Read current last_task_alive from shared memory for this ring
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
 
-    CYCLE_COUNT_LAP(g_orch_sync_cycle);
+        orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        PTO2TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
+        CYCLE_COUNT_LAP(g_orch_sync_cycle);
+
+        for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+            PTO2TaskId dep_task_id = args.explicit_dep(i);
+            if (!dep_task_id.is_valid()) {
+                orch->report_fatal(
+                    PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+                );
+                return result;
+            }
+            uint8_t dep_ring_id = dep_task_id.ring();
+            PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
+            int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
+            int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
+            if (dep_local_task_id < dep_last_task_alive) {
+                continue;
+            }
+            int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
+            PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+            if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, &fanin_builder, ring_id)) {
+                return result;
+            }
+        }
+
+        // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
+        DepInputs dep_inputs{
+            args.tensor_count(), args.tensor_data(), args.tag_data(),
+            static_cast<int32_t>(args.explicit_dep_count()), args.explicit_deps_data(),
+        };
+
+        auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
+            uint8_t prod_ring = producer_task_id.ring();
+            PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
+            int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+            PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
+            return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, &fanin_builder, ring_id);
+        };
+
+        if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
             return result;
         }
-        uint8_t dep_ring_id = dep_task_id.ring();
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (dep_local_task_id < dep_last_task_alive) {
-            continue;
+
+        CYCLE_COUNT_LAP(g_orch_lookup_cycle);
+
+        // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
+        if (layout.needs_tensormap_registration) {
+            register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
         }
-        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, &fanin_builder, ring_id)) {
-            return result;
+
+        CYCLE_COUNT_LAP(g_orch_insert_cycle);
+
+        // === STEP 5: Batch-write to GM (single cache line burst) ===
+        // Deferred from allocation phase to avoid scattered GM writes that get
+        // evicted by TensorMap lookup/insert cache pressure.
+        __builtin_prefetch(&task, 1, 1);
+        write_submit_descriptor(
+            task, task_id, prepared.alloc_result.packed_base, prepared.alloc_result.packed_end, aic_kernel_id,
+            aiv0_kernel_id, aiv1_kernel_id
+        );
+
+        // Increment fanout_count on each producer (no lock — only orch writes this field).
+        // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
+        for_each_fanin_storage(
+            fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
+            [](PTO2TaskSlotState *producer) {
+                producer->fanout_count++;
+            }
+        );
+
+        int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
+        // Store fanin metadata in payload for scheduler to iterate.
+        payload.fanin_actual_count = fanin_builder.count;
+        payload.fanin_spill_start = fanin_builder.spill_start;
+        payload.fanin_spill_pool = &fanin_builder.spill_pool;
+        for (int i = 0; i < inline_count; i++) {
+            payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
         }
-    }
-
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
-    DepInputs dep_inputs{
-        args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
-        args.explicit_deps_data(),
-    };
-
-    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        uint8_t prod_ring = producer_task_id.ring();
-        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
-        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
-        PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, &fanin_builder, ring_id);
-    };
-
-    if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
-        return result;
-    }
-
-    CYCLE_COUNT_LAP(g_orch_lookup_cycle);
-
-    // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
-
-    CYCLE_COUNT_LAP(g_orch_insert_cycle);
-
-    // === STEP 5: Batch-write to GM (single cache line burst) ===
-    // Deferred from allocation phase to avoid scattered GM writes that get
-    // evicted by TensorMap lookup/insert cache pressure.
-    __builtin_prefetch(&task, 1, 1);
-    task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
-    task.packed_buffer_base = prepared.alloc_result.packed_base;
-    task.packed_buffer_end = prepared.alloc_result.packed_end;
-
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
-        }
-    );
-
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Store fanin metadata in payload for scheduler to iterate
-    payload.fanin_actual_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) {
-        payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
@@ -701,13 +1627,59 @@ static TaskOutputTensors submit_task_common(
     g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
-        SPIN_WAIT_HINT();
+    if (defer_dependencies) {
+        PTO2DeferredSubmitRecord *record = nullptr;
+        PTO2SubmitCommitRecord commit_record{};
+        if (orch->submit_pipeline_compact_deferred_records) {
+            record = append_deferred_submit_task_batch_record_slot(orch);
+        } else {
+            commit_record.kind = PTO2SubmitPipelineRecordKind::TASK_DEFERRED;
+            commit_record.payload = &payload;
+            commit_record.slot_state = &cur_slot_state;
+            commit_record.scheduler = sched;
+            commit_record.task = &task;
+            commit_record.alloc_result = prepared.alloc_result;
+            commit_record.task_id = task_id;
+            commit_record.needs_tensormap_registration = layout.needs_tensormap_registration;
+            record = nullptr;
+        }
+        PTO2DeferredSubmitRecord deferred_record{};
+        PTO2DeferredSubmitRecord &target = record != nullptr ? *record : deferred_record;
+        target.payload = &payload;
+        target.slot_state = &cur_slot_state;
+        target.scheduler = sched;
+        target.packed_buffer_base = prepared.alloc_result.packed_base;
+        target.packed_buffer_end = prepared.alloc_result.packed_end;
+        target.task_id = task_id;
+        target.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+        target.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+        target.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+        target.explicit_dep_count = static_cast<int32_t>(args.explicit_dep_count());
+        target.in_manual_scope = orch->in_manual_scope();
+        target.needs_tensormap_registration = layout.needs_tensormap_registration;
+        for (int32_t i = 0; i < target.explicit_dep_count; i++) {
+            target.explicit_deps[i] = args.explicit_dep(static_cast<uint32_t>(i));
+        }
+        if (!orch->submit_pipeline_compact_deferred_records) {
+            commit_record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+            commit_record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+            commit_record.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+            commit_record.explicit_dep_count = target.explicit_dep_count;
+            commit_record.in_manual_scope = target.in_manual_scope;
+            for (int32_t i = 0; i < target.explicit_dep_count; i++) {
+                commit_record.explicit_deps[i] = target.explicit_deps[i];
+            }
+            append_submit_task_batch_record(orch, commit_record);
+        }
+    } else {
+        // === STEP 6: push to wiring queue ===
+        // Deferred wiring: orchestrator only stores dependency metadata and increments
+        // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
+        // is handled asynchronously by scheduler thread 0 via the wiring queue.
+        // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness.
+        while (!sched->wiring.queue.push(&cur_slot_state)) {
+            SPIN_WAIT_HINT();
+        }
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -917,6 +1889,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
 void PTO2OrchestratorState::mark_done() {
     auto *orch = this;
+    orch->flush_submit_pipeline();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
         if (total_tasks > 0) {

@@ -192,6 +192,16 @@ public:
 
     int32_t window_size() const { return window_size_; }
 
+    bool allocation_would_block_on_heap(int32_t output_size) {
+        if (output_size <= 0) {
+            return false;
+        }
+        uint64_t aligned_size = PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE);
+        int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
+        update_heap_tail(last_alive);
+        return !heap_can_fit(aligned_size);
+    }
+
     uint64_t heap_available() const {
         uint64_t tail = heap_tail_;
         if (heap_top_ >= tail) {
@@ -328,6 +338,18 @@ private:
         }
 
         return result;
+    }
+
+    bool heap_can_fit(uint64_t alloc_size) const {
+        if (alloc_size == 0) {
+            return true;
+        }
+        uint64_t top = heap_top_;
+        uint64_t tail = heap_tail_;
+        if (top >= tail) {
+            return heap_size_ - top >= alloc_size || tail > alloc_size;
+        }
+        return tail - top > alloc_size;
     }
 
 #if PTO2_ORCH_PROFILING

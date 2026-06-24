@@ -664,6 +664,8 @@ struct PTO2SchedulerState {
 
         // --- Orchestrator write, thread 0 read ---
         alignas(64) std::atomic<bool> orch_needs_drain{false};
+        std::atomic<uint64_t> orch_drain_hint_seq{0};
+        uint64_t orch_drain_hint_seen{0};
     } wiring;
 
     static_assert(
@@ -696,9 +698,11 @@ struct PTO2SchedulerState {
 
         // Refill local batch buffer when exhausted.
         if (wiring.batch_index >= wiring.batch_count) {
+            uint64_t drain_hint_seq = wiring.orch_drain_hint_seq.load(std::memory_order_acquire);
+            bool has_drain_hint = drain_hint_seq != wiring.orch_drain_hint_seen;
             // Backoff: defer pop when queue holds fewer than a full batch,
             // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
+            if (!force_drain && !has_drain_hint && wiring.queue.size() < WiringState::BATCH_SIZE) {
                 if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
                     wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
                     wiring.backoff_counter++;
@@ -708,6 +712,9 @@ struct PTO2SchedulerState {
             wiring.backoff_counter = 0;
             wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
             wiring.batch_index = 0;
+            if (has_drain_hint) {
+                wiring.orch_drain_hint_seen = drain_hint_seq;
+            }
             if (wiring.batch_count == 0) return 0;
         }
 
@@ -750,6 +757,28 @@ struct PTO2SchedulerState {
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
         }
+    }
+
+    uint64_t publish_ready_no_fanin(PTO2TaskSlotState *slot_state) {
+        slot_state->fanin_count = 1;
+        slot_state->fanin_refcount.store(1, std::memory_order_release);
+        slot_state->dep_pool_mark = 0;
+
+        uint64_t spin_count = 0;
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY) {
+            while (!dummy_ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        } else {
+            auto &ready_queue = ready_queues[static_cast<int32_t>(shape)];
+            while (!ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        }
+        return spin_count;
     }
 
     /**
@@ -870,6 +899,42 @@ struct PTO2SchedulerState {
     void release_producer(PTO2TaskSlotState &slot_state) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         check_and_handle_consumed(slot_state);
+    }
+
+    void release_producers(PTO2TaskSlotState **slot_states, int32_t count) {
+        bool ring_needs_advance[PTO2_MAX_RING_DEPTH] = {};
+        for (int32_t i = 0; i < count; i++) {
+            PTO2TaskSlotState &slot_state = *slot_states[i];
+            int32_t new_refcount = slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (new_refcount != slot_state.fanout_count) {
+                continue;
+            }
+
+            PTO2TaskState expected = PTO2_TASK_COMPLETED;
+            if (!slot_state.task_state.compare_exchange_strong(
+                    expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                continue;
+            }
+
+#if PTO2_SCHED_PROFILING
+            tasks_consumed.fetch_add(1, std::memory_order_relaxed);
+#endif
+            ring_needs_advance[slot_state.ring_id] = true;
+        }
+
+        for (int32_t ring_id = 0; ring_id < PTO2_MAX_RING_DEPTH; ring_id++) {
+            if (!ring_needs_advance[ring_id]) {
+                continue;
+            }
+            int32_t expected_lock = 0;
+            if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+                    expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+                )) {
+                ring_sched_states[ring_id].advance_ring_pointers();
+                ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+            }
+        }
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING

@@ -35,6 +35,8 @@ Runtime::Runtime() {
     aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     orch_to_sched = false;
+    pipeline_strategy = -1;
+    pipeline_defer_submit_disabled = false;
 
     // Initialize device orchestration state
     gm_sm_ptr_ = nullptr;

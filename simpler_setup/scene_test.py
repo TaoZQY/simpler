@@ -1089,6 +1089,14 @@ class SceneTestCase:
         # explicitly in their config dict.
         config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        block_dim_env = os.environ.get("SIMPLER_BLOCK_DIM")
+        if block_dim_env:
+            config.block_dim = int(block_dim_env)
+        aicpu_thread_env = os.environ.get("SIMPLER_AICPU_THREAD_NUM")
+        if aicpu_thread_env:
+            config.aicpu_thread_num = int(aicpu_thread_env)
+        elif os.environ.get("SIMPLER_PIPELINE_STRATEGY") == "1":
+            config.aicpu_thread_num = max(config.aicpu_thread_num, 4)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
         # PTO2_RING_* env vars / RUNTIME_ENV.
