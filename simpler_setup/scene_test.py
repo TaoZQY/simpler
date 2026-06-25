@@ -1088,7 +1088,25 @@ class SceneTestCase:
         # at run() time. Cases that need a specific value still set it
         # explicitly in their config dict.
         config.block_dim = config_dict.get("block_dim", 0)
+        block_dim_env = os.environ.get("SIMPLER_BLOCK_DIM")
+        if block_dim_env:
+            try:
+                config.block_dim = int(block_dim_env)
+            except ValueError as exc:
+                raise ValueError(f"SIMPLER_BLOCK_DIM must be an integer, got {block_dim_env!r}") from exc
+            if config.block_dim < 0:
+                raise ValueError(f"SIMPLER_BLOCK_DIM must be >= 0, got {config.block_dim}")
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        aicpu_thread_num_env = os.environ.get("SIMPLER_AICPU_THREAD_NUM")
+        if aicpu_thread_num_env:
+            try:
+                config.aicpu_thread_num = int(aicpu_thread_num_env)
+            except ValueError as exc:
+                raise ValueError(
+                    f"SIMPLER_AICPU_THREAD_NUM must be an integer, got {aicpu_thread_num_env!r}"
+                ) from exc
+            if config.aicpu_thread_num <= 0:
+                raise ValueError(f"SIMPLER_AICPU_THREAD_NUM must be > 0, got {config.aicpu_thread_num}")
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
         # PTO2_RING_* env vars / RUNTIME_ENV. Each value is either a scalar

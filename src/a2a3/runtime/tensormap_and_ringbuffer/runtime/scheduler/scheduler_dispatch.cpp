@@ -758,6 +758,49 @@ int32_t SchedulerContext::try_speculative_early_dispatch(int32_t thread_idx) {
 // Main scheduler dispatch loop
 // =============================================================================
 
+int32_t SchedulerContext::resolve_wiring(Runtime *runtime, int32_t thread_idx, bool force_drain) {
+    always_assert(sched_ != nullptr);
+    PTO2SharedMemoryHeader *header = sched_->sm_header;
+    if (!header) {
+        LOG_ERROR("PTO2 wiring: header is null");
+        return -1;
+    }
+    LOG_INFO_V0("Thread %d: resolve_wiring entry", thread_idx);
+
+#if PTO2_PROFILING
+    uint64_t wire_start_ts = get_sys_cnt_aicpu();
+#endif
+    int32_t wired_total = 0;
+    int32_t idle_iterations = 0;
+
+    while (!completed_.load(std::memory_order_acquire)) {
+        int wired = sched_->drain_wiring_queue(force_drain || orchestrator_done_);
+        if (wired > 0) {
+            wired_total += wired;
+            idle_iterations = 0;
+            continue;
+        }
+
+        idle_iterations++;
+        if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
+            LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
+            if (action == LoopAction::BREAK_LOOP) break;
+        }
+        SPIN_WAIT_HINT();
+    }
+
+#if PTO2_PROFILING
+    uint64_t wire_end_ts = get_sys_cnt_aicpu();
+    LOG_INFO_V9(
+        "Thread %d: wire_start=%" PRIu64 " wire_end=%" PRIu64 " wire_cost=%.3fus wired=%d", thread_idx,
+        static_cast<uint64_t>(wire_start_ts), static_cast<uint64_t>(wire_end_ts),
+        cycles_to_us(wire_end_ts - wire_start_ts), wired_total
+    );
+#endif
+    LOG_INFO_V0("Thread %d: resolve_wiring exit, wired=%d", thread_idx, wired_total);
+    return wired_total;
+}
+
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -1017,7 +1060,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 3: Drain wiring queue (thread 0 only)
         int wired = 0;
-        if (thread_idx == 0) {
+        if (!external_wiring_ && thread_idx == 0) {
             wired = sched_->drain_wiring_queue(orchestrator_done_);
             if (wired > 0) {
                 made_progress = true;

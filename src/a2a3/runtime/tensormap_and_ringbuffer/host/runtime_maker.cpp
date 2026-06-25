@@ -421,6 +421,41 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
+    // Optional pipeline layout. Default stays the upstream baseline.
+    {
+        const char *env_val = std::getenv("SIMPLER_PIPELINE_STRATEGY");
+        runtime->pipeline_strategy = RUNTIME_PIPELINE_STRATEGY_BASELINE;
+        if (env_val != nullptr && env_val[0] != '\0') {
+            char *endptr = nullptr;
+            errno = 0;
+            long parsed = std::strtol(env_val, &endptr, 10);
+            if (errno == 0 && endptr != env_val && *endptr == '\0') {
+                runtime->pipeline_strategy = static_cast<int32_t>(parsed);
+            } else {
+                LOG_WARN("SIMPLER_PIPELINE_STRATEGY=%s invalid, using baseline", env_val);
+            }
+        }
+        runtime->orch1_wire_force_drain = false;
+        if (runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE) {
+            const char *force_env = std::getenv("SIMPLER_ORCH1_WIRE_FORCE_DRAIN");
+            if (force_env != nullptr &&
+                (force_env[0] == '1' || force_env[0] == 't' || force_env[0] == 'T')) {
+                runtime->orch1_wire_force_drain = true;
+            }
+
+            const char *post_sched_env = std::getenv("SIMPLER_ORCH1_POST_SCHED");
+            if (post_sched_env != nullptr &&
+                (post_sched_env[0] == '1' || post_sched_env[0] == 't' || post_sched_env[0] == 'T')) {
+                runtime->orch_to_sched = true;
+            }
+            LOG_INFO_V0(
+                "Pipeline strategy %d: orch1_wire_force_drain=%d, post_sched=%d", runtime->pipeline_strategy,
+                runtime->orch1_wire_force_drain ? 1 : 0, runtime->orch_to_sched ? 1 : 0
+            );
+        }
+        LOG_INFO_V0("Pipeline strategy: %d", runtime->pipeline_strategy);
+    }
+
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena all live in a single backing allocation;
     // setup_static_arena reserves the three regions and commits in one shot.

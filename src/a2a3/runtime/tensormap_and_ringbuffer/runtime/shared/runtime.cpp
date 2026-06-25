@@ -34,6 +34,8 @@ Runtime::Runtime() {
     worker_count = 0;
     aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    pipeline_strategy = RUNTIME_PIPELINE_STRATEGY_BASELINE;
+    orch1_wire_force_drain = false;
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;

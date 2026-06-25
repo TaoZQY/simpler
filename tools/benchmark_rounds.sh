@@ -11,7 +11,7 @@
 # in five columns:
 #   - Host   from RunTiming (host_wall_us)
 #   - Device from RunTiming (device_wall_us, AICPU orch mailbox)
-#   - Total  device-log: full span across sched/orch events
+#   - Total  device-log: full span across sched/orch/wire events
 #   - Sched  device-log: sched_start -> sched_end
 #   - Orch   device-log: orch_start  -> orch_end
 #
@@ -57,6 +57,8 @@ ROUNDS=100
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
+BLOCK_DIM="${SIMPLER_BLOCK_DIM:-}"
+AICPU_THREAD_NUM="${SIMPLER_AICPU_THREAD_NUM:-}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -77,6 +79,14 @@ while [[ $# -gt 0 ]]; do
             RUNTIME="$2"
             shift 2
             ;;
+        --block-dim)
+            BLOCK_DIM="$2"
+            shift 2
+            ;;
+        --aicpu-thread-num)
+            AICPU_THREAD_NUM="$2"
+            shift 2
+            ;;
         -v|--verbose)
             VERBOSE=1
             shift
@@ -86,13 +96,16 @@ while [[ $# -gt 0 ]]; do
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [--block-dim <n>] [--aicpu-thread-num <n>] [-v]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default)
+  --block-dim    Override each case's CallConfig block_dim via SIMPLER_BLOCK_DIM
+  --aicpu-thread-num
+                 Override each case's CallConfig aicpu_thread_num via SIMPLER_AICPU_THREAD_NUM
   -v, --verbose  Save detailed test_*.py output to a timestamped log file
   -h, --help     Show this help
 
@@ -114,6 +127,13 @@ USAGE
             ;;
     esac
 done
+
+if [[ -n "$BLOCK_DIM" ]]; then
+    export SIMPLER_BLOCK_DIM="$BLOCK_DIM"
+fi
+if [[ -n "$AICPU_THREAD_NUM" ]]; then
+    export SIMPLER_AICPU_THREAD_NUM="$AICPU_THREAD_NUM"
+fi
 
 # ---------------------------------------------------------------------------
 # Verbose logging setup
@@ -191,7 +211,7 @@ parse_timing() {
     local dev_timing_file
     dev_timing_file=$(mktemp)
     trap 'rm -f -- "$dev_timing_file"' RETURN
-    grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' \
+    grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end|wire_start|wire_end)' \
         "$log_file" > "$dev_timing_file" 2>/dev/null || true
 
     if [[ ! -s "$fw_file" && ! -s "$dev_timing_file" ]]; then
@@ -280,6 +300,16 @@ parse_timing() {
         match($0, /sched_end[^=]*=([0-9]+)/, m)
         val = m[1] + 0
         if (val > max_sched_end) max_sched_end = val
+        if (val > max_end) max_end = val
+    }
+    /wire_start=/ {
+        match($0, /wire_start=([0-9]+)/, m)
+        val = m[1] + 0
+        if (min_start == 0 || val < min_start) min_start = val
+    }
+    /wire_end=/ {
+        match($0, /wire_end=([0-9]+)/, m)
+        val = m[1] + 0
         if (val > max_end) max_end = val
     }
     /orch_end=/ {

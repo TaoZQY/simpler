@@ -111,8 +111,12 @@ struct OrchSoEntry {
 };
 
 struct AicpuExecutor {
-    int32_t sched_thread_num_;
+    int32_t sched_thread_num_{0};
+    int32_t primary_orch_thread_idx_{0};
+    int32_t wire_thread_idx_{-1};
     bool orch_to_sched_{false};
+    bool external_wiring_{false};
+    bool wire_force_drain_{false};
 
     // ===== Thread management state =====
     std::atomic<int32_t> thread_idx_{0};
@@ -182,21 +186,50 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
-    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
-    // count at -1.
+    // Read execution parameters from runtime. The 0 -> 1 fixup runs before the
+    // role derivation so a zero input does not leave the scheduler count at -1.
     aicpu_thread_num_ = runtime->aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
-    sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
+    external_wiring_ = runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE;
+    wire_force_drain_ = external_wiring_ && runtime->orch1_wire_force_drain;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
+    if (external_wiring_ && aicpu_thread_num_ < 3) {
+        LOG_ERROR(
+            "Pipeline strategy %d requires at least 3 AICPU threads, got %d", runtime->pipeline_strategy,
+            aicpu_thread_num_
+        );
+        init_failed_.store(true, std::memory_order_release);
+        return -1;
+    }
+    if (external_wiring_) {
+        sched_thread_num_ = aicpu_thread_num_ - 2;
+        if (orch_to_sched_) {
+            primary_orch_thread_idx_ = sched_thread_num_;
+            wire_thread_idx_ = aicpu_thread_num_ - 1;
+        } else {
+            wire_thread_idx_ = sched_thread_num_;
+            primary_orch_thread_idx_ = aicpu_thread_num_ - 1;
+        }
+    } else {
+        sched_thread_num_ = aicpu_thread_num_ - 1;
+        wire_thread_idx_ = -1;
+        primary_orch_thread_idx_ = sched_thread_num_;
+    }
+    LOG_INFO_V0(
+        "AicpuExecutor layout: threads=%d sched=%d wire=%d orch=%d strategy=%d force_wire=%d", aicpu_thread_num_,
+        sched_thread_num_, wire_thread_idx_, primary_orch_thread_idx_, runtime->pipeline_strategy,
+        wire_force_drain_ ? 1 : 0
+    );
 
-    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(
+            runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs(), external_wiring_
+        ) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -366,8 +399,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
-    // Orchestrator check
-    if (thread_idx >= sched_thread_num_) {
+    const bool is_primary_orchestrator = thread_idx == primary_orch_thread_idx_;
+    const bool is_wire_thread = external_wiring_ && thread_idx == wire_thread_idx_;
+
+    // Primary orchestrator check
+    if (is_primary_orchestrator) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
         int32_t pto2_submitted_tasks = -1;
@@ -685,8 +721,30 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
+    // Dedicated Orch1 wire thread: drain the normal wiring queue while
+    // Scheduler0 keeps dummy-drain, completion, and dispatch ownership.
+    if (is_wire_thread) {
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+        if (rt == nullptr) {
+            LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping wiring", thread_idx);
+        } else {
+            sched_ctx_.bind_runtime(rt);
+            int32_t wired = sched_ctx_.resolve_wiring(runtime, thread_idx, wire_force_drain_);
+            if (wired < 0) {
+                LOG_ERROR("Thread %d: Wiring failed with rc=%d", thread_idx, wired);
+                run_rc = wired;
+            } else {
+                LOG_INFO_V0("Thread %d: Wired %d tasks from runtime", thread_idx, wired);
+            }
+        }
+    }
+
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
-    if (!sched_ctx_.is_completed() && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
+    const bool can_dispatch_as_scheduler =
+        thread_idx < sched_thread_num_ || (orch_to_sched_ && is_primary_orchestrator);
+    if (!sched_ctx_.is_completed() && can_dispatch_as_scheduler) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
@@ -754,7 +812,11 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
+    primary_orch_thread_idx_ = 0;
+    wire_thread_idx_ = -1;
     orch_to_sched_ = false;
+    external_wiring_ = false;
+    wire_force_drain_ = false;
 
     orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: the

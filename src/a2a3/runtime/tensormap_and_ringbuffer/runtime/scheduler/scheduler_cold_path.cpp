@@ -756,8 +756,13 @@ bool SchedulerContext::assign_cores_to_threads() {
 // Reassign all cores across all threads (sched + orchestrator) after orchestration.
 // =============================================================================
 void SchedulerContext::reassign_cores_for_all_threads() {
+    int32_t reassigned_thread_num = sched_thread_num_ + 1;
+    if (reassigned_thread_num > aicpu_thread_num_) {
+        reassigned_thread_num = aicpu_thread_num_;
+    }
     LOG_INFO_V0(
-        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", aicpu_thread_num_, aic_count_, aiv_count_
+        "Reassigning cores (cluster-aligned) for %d sched threads: %d AIC, %d AIV", reassigned_thread_num,
+        aic_count_, aiv_count_
     );
 
     // Collect running worker_ids from all current trackers
@@ -774,7 +779,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
     int32_t cluster_count = aic_count_;
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % aicpu_thread_num_]++;
+        clusters_per_thread[ci % reassigned_thread_num]++;
     }
 
     // Re-init all trackers and reset core counts
@@ -785,7 +790,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
     // Assign clusters round-robin and restore running state
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % aicpu_thread_num_;
+        int32_t t = ci % reassigned_thread_num;
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
@@ -819,7 +824,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
             core_trackers_[t].get_cluster_count(), aic_running, aiv_running
         );
     }
-    active_sched_threads_ = aicpu_thread_num_;
+    active_sched_threads_ = reassigned_thread_num;
 }
 
 // =============================================================================
@@ -850,7 +855,8 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // Lifecycle: init / deinit
 // =============================================================================
 int32_t SchedulerContext::init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base,
+    bool external_wiring
 ) {
     always_assert(runtime != nullptr);
 
@@ -861,6 +867,7 @@ int32_t SchedulerContext::init(
     aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
     orch_to_sched_ = orch_to_sched;
+    external_wiring_ = external_wiring;
     regs_ = regs_base;
 
 #if PTO2_PROFILING
@@ -882,7 +889,13 @@ int32_t SchedulerContext::init(
             // active_sched_threads_). Without it, init_phase would prime zero
             // sched pools and all sched_phase emits would silently drop.
             const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
-            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            int sched_phase_threads = active_sched;
+            if (orch_to_sched_) {
+                sched_phase_threads = sched_thread_num_ + 1;
+                if (sched_phase_threads > aicpu_thread_num_) {
+                    sched_phase_threads = aicpu_thread_num_;
+                }
+            }
             // Orchestration is always single-threaded, so orch-phase is one pool
             // (ordinal 0) in both modes — see record_orch_phase.
             const int orch_phase_threads = 1;
@@ -911,7 +924,14 @@ int32_t SchedulerContext::init(
     // orchestrator thread (see aicpu_executor.cpp).
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
-        dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : active_sched_threads_);
+        int dump_threads = active_sched_threads_;
+        if (orch_to_sched_) {
+            dump_threads = sched_thread_num_ + 1;
+            if (dump_threads > aicpu_thread_num_) {
+                dump_threads = aicpu_thread_num_;
+            }
+        }
+        dump_args_init(dump_threads);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -1011,6 +1031,7 @@ void SchedulerContext::deinit() {
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
+    external_wiring_ = false;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};

@@ -56,6 +56,13 @@
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
+// Pipeline scheduling strategy selected by SIMPLER_PIPELINE_STRATEGY.
+// -1 preserves the upstream baseline: one Orch thread + N scheduler threads,
+// with Scheduler0 draining the wiring queue.
+// 0 splits Scheduler0's normal wiring drain into a dedicated Orch1 wire thread.
+constexpr int32_t RUNTIME_PIPELINE_STRATEGY_BASELINE = -1;
+constexpr int32_t RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE = 0;
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -201,6 +208,8 @@ public:
     // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
+    int32_t pipeline_strategy;
+    bool orch1_wire_force_drain;
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose

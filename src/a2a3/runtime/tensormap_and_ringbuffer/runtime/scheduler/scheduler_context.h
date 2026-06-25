@@ -61,8 +61,10 @@ public:
     // - Binds func_id_to_addr_ / initial sched_ (if rt is already known)
     // - Captures AICore-register base (consumed by handshake_all_cores())
     // Returns 0 on success, negative on failure (handshake / assignment error).
-    int32_t
-    init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base);
+    int32_t init(
+        Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base,
+        bool external_wiring = false
+    );
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
@@ -74,6 +76,9 @@ public:
 
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
+
+    // Dedicated external wiring entry: drain normal submit wiring from Orch1.
+    int32_t resolve_wiring(Runtime *runtime, int32_t thread_idx, bool force_drain);
 
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (PTO2_PROFILING) before deinit when enabled.
@@ -156,6 +161,7 @@ private:
     int32_t active_sched_threads_{0};
     int32_t sched_thread_num_{0};
     bool orch_to_sched_{false};
+    bool external_wiring_{false};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
