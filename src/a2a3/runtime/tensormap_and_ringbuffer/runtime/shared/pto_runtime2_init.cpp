@@ -186,6 +186,9 @@ bool PTO2SchedulerState::init_data_from_layout(
     sched->wiring.batch_count = 0;
     sched->wiring.batch_index = 0;
     sched->wiring.backoff_counter = 0;
+    sched->scope_end_offload_queue.reset();
+    sched->finalize_offload_queue.reset();
+    sched->deferred_submit_queue.reset();
 
     return true;
 }

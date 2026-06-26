@@ -115,6 +115,12 @@ struct PTO2OrchestratorState {
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
 
+    bool no_fanin_ready_fastpath{false};
+    bool scope_end_offload_to_orch1{false};
+    bool finalize_offload_to_orch1{false};
+    bool defer_submit_to_orch1{false};
+    bool o_pipeline_profile{false};
+
     // === STATISTICS ===
 #if PTO2_PROFILING
     int64_t tasks_submitted;
@@ -177,6 +183,7 @@ struct PTO2OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     TaskOutputTensors submit_dummy_task(const L0TaskArgs &args);
     TaskOutputTensors alloc_tensors(const L0TaskArgs &args);
+    int32_t drain_deferred_submit_to_orch1(int32_t max_entries = 8);
     void mark_done();
 };
 
@@ -184,7 +191,7 @@ struct PTO2OrchestratorState {
 // Orchestrator Profiling Data
 // =============================================================================
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;  // Combined task slot + heap allocation
@@ -193,6 +200,8 @@ struct PTO2OrchProfilingData {
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
     uint64_t scope_end_cycle;
+    uint64_t payload_init_cycle;
+    uint64_t finalize_entry_cycle;
     int64_t submit_count;
     // Wait time tracking for blocking phases
     uint64_t alloc_wait_cycle;  // Cycles spent waiting in unified alloc

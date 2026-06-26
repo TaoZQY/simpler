@@ -30,6 +30,7 @@
 #pragma once
 
 #include <atomic>
+#include <string.h>
 
 #include "common/core_type.h"
 #include "utils/device_arena.h"
@@ -542,6 +543,228 @@ struct alignas(64) PTO2SpscQueue {
 static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
 // =============================================================================
 
+// O0 -> O1 ordered submit queue. TASK records defer TensorMap dependency
+// computation, fanin metadata, descriptor write, and ready/wiring publication to
+// Orch1. SCOPE_END records share the same queue so scope releases preserve the
+// submit order built by O0.
+struct alignas(64) PTO2DeferredSubmitQueue {
+    static constexpr uint32_t CAPACITY = 128;  // power of two
+    static constexpr uint32_t MASK = CAPACITY - 1;
+    static constexpr int32_t EXPLICIT_DEP_CAP = 64;
+    static constexpr int32_t SCOPE_CHUNK_SIZE = 32;
+
+    enum class Kind : uint8_t {
+        TASK = 0,
+        SCOPE_END = 1,
+    };
+
+    struct Entry {
+        Kind kind{Kind::TASK};
+
+        PTO2TaskSlotState *slot_state{nullptr};
+        PTO2TaskDescriptor *task{nullptr};
+        PTO2TaskPayload *payload{nullptr};
+        PTO2TaskId task_id = PTO2TaskId::invalid();
+        void *packed_buffer_base{nullptr};
+        void *packed_buffer_end{nullptr};
+        int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT] = {INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+
+        int32_t tensor_count{0};
+        uint8_t tags[MAX_TENSOR_ARGS]{};
+        int32_t explicit_dep_count{0};
+        PTO2TaskId explicit_deps[EXPLICIT_DEP_CAP]{};
+        bool in_manual_scope{false};
+
+        int32_t scope_count{0};
+        PTO2TaskSlotState *scope_slots[SCOPE_CHUNK_SIZE]{};
+    };
+
+    alignas(64) std::atomic<uint32_t> head{0};
+    alignas(64) std::atomic<uint32_t> tail{0};
+    alignas(64) Entry entries[CAPACITY];
+
+    void reset() {
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+
+    bool push(const Entry &src) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        entries[h & MASK] = src;
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
+    Entry *pop() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        uint32_t h = head.load(std::memory_order_acquire);
+        if (t == h) {
+            return nullptr;
+        }
+        return &entries[t & MASK];
+    }
+
+    void pop_done() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        tail.store(t + 1, std::memory_order_release);
+    }
+
+    bool empty() const {
+        return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
+    }
+};
+
+// O0 -> O1 offload queue for scope_end releases. Each entry carries a small
+// chunk of task slots whose scope reference should be released by Orch1.
+struct alignas(64) PTO2ScopeEndOffloadQueue {
+    static constexpr uint32_t CHUNK_SIZE = 32;
+    static constexpr uint32_t CAPACITY = 256;  // power of two
+    static constexpr uint32_t MASK = CAPACITY - 1;
+
+    struct Entry {
+        int32_t count{0};
+        PTO2TaskSlotState *slots[CHUNK_SIZE]{};
+    };
+
+    alignas(64) std::atomic<uint32_t> head{0};
+    alignas(64) std::atomic<uint32_t> tail{0};
+    alignas(64) Entry entries[CAPACITY];
+
+    void reset() {
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+
+    bool push_chunk(PTO2TaskSlotState **slots, int32_t count) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        Entry &entry = entries[h & MASK];
+        entry.count = count;
+        for (int32_t i = 0; i < count; i++) {
+            entry.slots[i] = slots[i];
+        }
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
+    Entry *pop() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        uint32_t h = head.load(std::memory_order_acquire);
+        if (t == h) {
+            return nullptr;
+        }
+        return &entries[t & MASK];
+    }
+
+    void pop_done() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        tail.store(t + 1, std::memory_order_release);
+    }
+
+    bool empty() const {
+        return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
+    }
+};
+
+// O0 -> O1 offload queue for per-submit finalize/publish work. O0 has already
+// allocated the slot, computed fanin, updated TensorMap, and materialized
+// OUTPUT tensors for the submit return value. O1 completes the remaining
+// payload/descriptor fields and publishes the task to ready/wiring.
+struct alignas(64) PTO2FinalizeOffloadQueue {
+    static constexpr uint32_t CAPACITY = 128;  // power of two
+    static constexpr uint32_t MASK = CAPACITY - 1;
+
+    struct Entry {
+        PTO2TaskSlotState *slot_state{nullptr};
+        PTO2TaskDescriptor *task{nullptr};
+        PTO2TaskPayload *payload{nullptr};
+        PTO2TaskId task_id = PTO2TaskId::invalid();
+        void *packed_buffer_base{nullptr};
+        void *packed_buffer_end{nullptr};
+        int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT] = {INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+
+        bool no_fanin_ready_fastpath{false};
+    };
+
+    alignas(64) std::atomic<uint32_t> head{0};
+    alignas(64) std::atomic<uint32_t> tail{0};
+    alignas(64) Entry entries[CAPACITY];
+
+    static void copy_entry(Entry &dst, const Entry &src) {
+        dst.slot_state = src.slot_state;
+        dst.task = src.task;
+        dst.payload = src.payload;
+        dst.task_id = src.task_id;
+        dst.packed_buffer_base = src.packed_buffer_base;
+        dst.packed_buffer_end = src.packed_buffer_end;
+        for (int32_t i = 0; i < PTO2_SUBTASK_SLOT_COUNT; i++) {
+            dst.kernel_id[i] = src.kernel_id[i];
+        }
+        dst.no_fanin_ready_fastpath = src.no_fanin_ready_fastpath;
+    }
+
+    void reset() {
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+
+    bool push(const Entry &src) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        copy_entry(entries[h & MASK], src);
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
+    template <typename FillFn>
+    bool push_with(FillFn &&fill) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        fill(entries[h & MASK]);
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
+    Entry *pop() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        uint32_t h = head.load(std::memory_order_acquire);
+        if (t == h) {
+            return nullptr;
+        }
+        return &entries[t & MASK];
+    }
+
+    void pop_done() {
+        uint32_t t = tail.load(std::memory_order_relaxed);
+        tail.store(t + 1, std::memory_order_release);
+    }
+
+    bool empty() const {
+        return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
+    }
+};
+
+struct PTO2FinalizeOffloadDrainStats {
+    uint64_t descriptor_cycle{0};
+    uint64_t publish_cycle{0};
+    int32_t direct_ready{0};
+    int32_t direct_wired{0};
+    int32_t to_wiring{0};
+};
+
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -687,6 +910,10 @@ struct PTO2SchedulerState {
         offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
     );
     static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
+
+    alignas(64) PTO2ScopeEndOffloadQueue scope_end_offload_queue;
+    alignas(64) PTO2FinalizeOffloadQueue finalize_offload_queue;
+    alignas(64) PTO2DeferredSubmitQueue deferred_submit_queue;
 
     alignas(64) AsyncWaitList async_wait_list;
 
@@ -834,6 +1061,199 @@ struct PTO2SchedulerState {
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
         }
+    }
+
+    uint64_t publish_ready_no_fanin(PTO2TaskSlotState *slot_state) {
+        slot_state->fanin_count = 1;
+        slot_state->fanin_refcount.store(1, std::memory_order_release);
+        slot_state->dep_pool_mark = ring_sched_states[slot_state->ring_id].dep_pool.top;
+
+        uint64_t spin_count = 0;
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY) {
+            while (!dummy_ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        } else {
+            auto &ready_queue = ready_queues[static_cast<int32_t>(shape)];
+            while (!ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        }
+        return spin_count;
+    }
+
+    bool publish_to_wiring_from_orch1(PTO2TaskSlotState *slot_state) {
+        while (!wiring.queue.push(slot_state)) {
+            (void)drain_wiring_queue(/*force_drain=*/true);
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        return true;
+    }
+
+    bool wire_from_orch1_or_queue(PTO2TaskSlotState *slot_state, bool *direct_wired = nullptr) {
+        if (direct_wired != nullptr) {
+            *direct_wired = false;
+        }
+
+        int ring_id = slot_state->ring_id;
+        auto &rss = ring_sched_states[ring_id];
+        int32_t wfanin = slot_state->payload->fanin_actual_count;
+        if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+            rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
+            if (rss.dep_pool.available() < wfanin) {
+                return publish_to_wiring_from_orch1(slot_state);
+            }
+        }
+
+        wire_task(rss, slot_state, wfanin);
+        if (direct_wired != nullptr) {
+            *direct_wired = true;
+        }
+        return true;
+    }
+
+    bool has_pending_wiring_work() const {
+        return wiring.batch_index < wiring.batch_count || wiring.queue.size() != 0;
+    }
+
+    void finalize_offloaded_entry(const PTO2FinalizeOffloadQueue::Entry &entry) {
+        PTO2TaskDescriptor *task = entry.task;
+
+        task->task_id = entry.task_id;
+        task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)];
+        task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] =
+            entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)];
+        task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] =
+            entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)];
+        task->packed_buffer_base = entry.packed_buffer_base;
+        task->packed_buffer_end = entry.packed_buffer_end;
+    }
+
+    bool publish_finalized_entry(
+        const PTO2FinalizeOffloadQueue::Entry &entry, bool *direct_ready = nullptr, bool *direct_wired = nullptr
+    ) {
+        PTO2TaskSlotState *slot_state = entry.slot_state;
+        bool direct = entry.no_fanin_ready_fastpath && slot_state->payload->fanin_actual_count == 0;
+        if (direct_ready != nullptr) {
+            *direct_ready = direct;
+        }
+        if (direct_wired != nullptr) {
+            *direct_wired = false;
+        }
+        if (direct) {
+            (void)publish_ready_no_fanin(slot_state);
+            return true;
+        }
+        return wire_from_orch1_or_queue(slot_state, direct_wired);
+    }
+
+    bool enqueue_finalize_offload(const PTO2FinalizeOffloadQueue::Entry &entry) {
+        if (finalize_offload_queue.push(entry)) {
+            return true;
+        }
+        wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!finalize_offload_queue.push(entry)) {
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                wiring.producer_blocked.store(0, std::memory_order_release);
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        wiring.producer_blocked.store(0, std::memory_order_release);
+        return true;
+    }
+
+    template <typename FillFn>
+    bool enqueue_finalize_offload_with(FillFn &&fill) {
+        if (finalize_offload_queue.push_with(fill)) {
+            return true;
+        }
+        wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!finalize_offload_queue.push_with(fill)) {
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                wiring.producer_blocked.store(0, std::memory_order_release);
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        wiring.producer_blocked.store(0, std::memory_order_release);
+        return true;
+    }
+
+    bool enqueue_deferred_submit(const PTO2DeferredSubmitQueue::Entry &entry) {
+        if (deferred_submit_queue.push(entry)) {
+            return true;
+        }
+        wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!deferred_submit_queue.push(entry)) {
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                wiring.producer_blocked.store(0, std::memory_order_release);
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        wiring.producer_blocked.store(0, std::memory_order_release);
+        return true;
+    }
+
+    int32_t drain_finalize_offload(int32_t max_entries = 8, PTO2FinalizeOffloadDrainStats *stats = nullptr) {
+        int32_t finalized = 0;
+        if (has_pending_wiring_work()) {
+            return 0;
+        }
+        for (int32_t n = 0; n < max_entries; n++) {
+            PTO2FinalizeOffloadQueue::Entry *entry = finalize_offload_queue.pop();
+            if (entry == nullptr) {
+                break;
+            }
+#if PTO2_PROFILING
+            uint64_t descriptor_t0 = stats != nullptr ? get_sys_cnt_aicpu() : 0;
+#endif
+            finalize_offloaded_entry(*entry);
+#if PTO2_PROFILING
+            uint64_t descriptor_t1 = stats != nullptr ? get_sys_cnt_aicpu() : 0;
+            if (stats != nullptr) {
+                stats->descriptor_cycle += descriptor_t1 - descriptor_t0;
+            }
+            uint64_t publish_t0 = descriptor_t1;
+#endif
+            bool direct_ready = false;
+            bool direct_wired = false;
+            bool published = publish_finalized_entry(*entry, &direct_ready, &direct_wired);
+            bool fallback_to_wiring = !direct_ready && !direct_wired;
+#if PTO2_PROFILING
+            uint64_t publish_t1 = stats != nullptr ? get_sys_cnt_aicpu() : 0;
+            if (stats != nullptr) {
+                stats->publish_cycle += publish_t1 - publish_t0;
+                if (direct_ready) {
+                    stats->direct_ready++;
+                } else if (direct_wired) {
+                    stats->direct_wired++;
+                } else {
+                    stats->to_wiring++;
+                }
+            }
+#endif
+            finalize_offload_queue.pop_done();
+            if (!published) {
+                return -1;
+            }
+            finalized++;
+            if (fallback_to_wiring) {
+                break;
+            }
+        }
+        return finalized;
     }
 
     /**
@@ -1249,6 +1669,34 @@ struct PTO2SchedulerState {
             release_producer_scope(*task_slot_states[i]);
         }
 #endif
+    }
+
+    void enqueue_scope_end_offload(PTO2TaskSlotState **task_slot_states, int32_t count) {
+        int32_t offset = 0;
+        while (offset < count) {
+            int32_t chunk = count - offset;
+            if (chunk > static_cast<int32_t>(PTO2ScopeEndOffloadQueue::CHUNK_SIZE)) {
+                chunk = static_cast<int32_t>(PTO2ScopeEndOffloadQueue::CHUNK_SIZE);
+            }
+            while (!scope_end_offload_queue.push_chunk(task_slot_states + offset, chunk)) {
+                SPIN_WAIT_HINT();
+            }
+            offset += chunk;
+        }
+    }
+
+    int32_t drain_scope_end_offload(int32_t max_entries = 8) {
+        int32_t released = 0;
+        for (int32_t n = 0; n < max_entries; n++) {
+            PTO2ScopeEndOffloadQueue::Entry *entry = scope_end_offload_queue.pop();
+            if (entry == nullptr) {
+                break;
+            }
+            on_scope_end(entry->slots, entry->count);
+            released += entry->count;
+            scope_end_offload_queue.pop_done();
+        }
+        return released;
     }
 
     /**

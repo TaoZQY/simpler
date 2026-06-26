@@ -75,7 +75,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_hea
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
@@ -95,7 +95,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
 l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
-// Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
+// Accumulated cycles per sub-step for O0/orchestrator profiling.
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
 static uint64_t g_orch_args_cycle = 0;       // param copy
@@ -103,6 +103,8 @@ static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
 static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
 static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
+static uint64_t g_orch_payload_init_cycle = 0;
+static uint64_t g_orch_finalize_entry_cycle = 0;
 static int64_t g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
@@ -110,51 +112,30 @@ uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-// Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
-// the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
-// printed in the cold-path log.
-//
-// Per-submit ORCH_SUBMIT record is the only swim-lane emit on the orch
-// path — one record per submit_task() / alloc_tensors() call spanning
-// the entire [start, end] window. Per-sub-step phase records were dropped
-// in favour of the cumulatives + per-submit envelope; the dispatcher
-// already inserts one record at the end of each submit path via
-// CYCLE_COUNT_ORCH_SUBMIT_RECORD.
-#define CYCLE_COUNT_START()                                                        \
-    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                                       \
+// Per-submit ORCH_SUBMIT record is the only swim-lane emit on the orch path:
+// one record per submit_task() / alloc_tensors() call spanning the entire
+// [start, end] window. Sub-step costs are exported through the cumulative
+// profiling counters printed by AicpuExecutor.
+#define CYCLE_COUNT_START()                                                            \
+    bool _swimlane_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
+    bool _prof_active = orch->o_pipeline_profile || _swimlane_active;                  \
+    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                    \
     uint64_t _submit_start_ts = _t0
-#define CYCLE_COUNT_LAP(acc)       \
-    do {                           \
-        _t1 = get_sys_cnt_aicpu(); \
-        acc += (_t1 - _t0);        \
-        _t0 = _t1;                 \
+#define CYCLE_COUNT_LAP(acc)            \
+    do {                                \
+        if (_prof_active) {             \
+            _t1 = get_sys_cnt_aicpu();  \
+            acc += (_t1 - _t0);         \
+            _t0 = _t1;                  \
+        }                               \
     } while (0)
 #define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
     do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                         \
-    } while (0)
-#elif PTO2_PROFILING
-#include "aicpu/device_time.h"
-#include "aicpu/l2_swimlane_collector_aicpu.h"
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-__attribute__((weak, visibility("hidden"))) void
-l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
-// submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
-static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                        \
-    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                \
-    uint64_t _submit_start_ts = _t0
-#define CYCLE_COUNT_LAP(acc) \
-    do {                     \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
-    do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            _t1 = get_sys_cnt_aicpu();                                                            \
+        if (_swimlane_active) {                                                                   \
+            if (!_prof_active) {                                                                  \
+                _submit_start_ts = get_sys_cnt_aicpu();                                           \
+                _t1 = _submit_start_ts;                                                           \
+            }                                                                                     \
             l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
         }                                                                                         \
     } while (0)
@@ -369,6 +350,230 @@ static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     return layout;
 }
 
+static void fill_finalize_offload_entry(
+    PTO2FinalizeOffloadQueue::Entry &entry, PTO2PreparedTask &prepared, PTO2TaskId task_id, int32_t aic_kernel_id,
+    int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, bool no_fanin_ready_fastpath
+) {
+    entry.slot_state = prepared.slot_state;
+    entry.task = prepared.task;
+    entry.payload = prepared.payload;
+    entry.task_id = task_id;
+    entry.packed_buffer_base = prepared.alloc_result.packed_base;
+    entry.packed_buffer_end = prepared.alloc_result.packed_end;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    entry.no_fanin_ready_fastpath = no_fanin_ready_fastpath;
+}
+
+static bool fill_deferred_submit_entry(
+    PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry, const L0TaskArgs &args,
+    PTO2PreparedTask &prepared, PTO2TaskId task_id, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
+    int32_t aiv1_kernel_id
+) {
+    if (args.explicit_dep_count() > PTO2DeferredSubmitQueue::EXPLICIT_DEP_CAP) {
+        orch->report_fatal(
+            PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "explicit dependency count %u exceeds deferred submit cap %d",
+            args.explicit_dep_count(), PTO2DeferredSubmitQueue::EXPLICIT_DEP_CAP
+        );
+        return false;
+    }
+
+    entry = PTO2DeferredSubmitQueue::Entry{};
+    entry.kind = PTO2DeferredSubmitQueue::Kind::TASK;
+    entry.slot_state = prepared.slot_state;
+    entry.task = prepared.task;
+    entry.payload = prepared.payload;
+    entry.task_id = task_id;
+    entry.packed_buffer_base = prepared.alloc_result.packed_base;
+    entry.packed_buffer_end = prepared.alloc_result.packed_end;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    entry.tensor_count = args.tensor_count();
+    entry.explicit_dep_count = static_cast<int32_t>(args.explicit_dep_count());
+    entry.in_manual_scope = orch->in_manual_scope();
+    for (int32_t i = 0; i < entry.tensor_count; i++) {
+        entry.tags[i] = static_cast<uint8_t>(args.tag(i));
+    }
+    for (int32_t i = 0; i < entry.explicit_dep_count; i++) {
+        entry.explicit_deps[i] = args.explicit_dep(static_cast<uint32_t>(i));
+    }
+    return true;
+}
+
+static bool enqueue_deferred_scope_end(
+    PTO2OrchestratorState *orch, PTO2TaskSlotState **task_slot_states, int32_t count
+) {
+    if (orch->scheduler == nullptr) {
+        return false;
+    }
+    int32_t offset = 0;
+    while (offset < count) {
+        int32_t chunk = count - offset;
+        if (chunk > PTO2DeferredSubmitQueue::SCOPE_CHUNK_SIZE) {
+            chunk = PTO2DeferredSubmitQueue::SCOPE_CHUNK_SIZE;
+        }
+        PTO2DeferredSubmitQueue::Entry entry{};
+        entry.kind = PTO2DeferredSubmitQueue::Kind::SCOPE_END;
+        entry.scope_count = chunk;
+        for (int32_t i = 0; i < chunk; i++) {
+            entry.scope_slots[i] = task_slot_states[offset + i];
+        }
+        if (!orch->scheduler->enqueue_deferred_submit(entry)) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+static void write_deferred_submit_descriptor(PTO2DeferredSubmitQueue::Entry &entry) {
+    PTO2TaskDescriptor *task = entry.task;
+    task->task_id = entry.task_id;
+    task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] =
+        entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)];
+    task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] =
+        entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)];
+    task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] =
+        entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)];
+    task->packed_buffer_base = entry.packed_buffer_base;
+    task->packed_buffer_end = entry.packed_buffer_end;
+}
+
+static bool append_deferred_fanin_or_fail(
+    PTO2OrchestratorState *orch, PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+) {
+    uint8_t prod_ring = producer_task_id.ring();
+    PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
+    int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+    PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
+    return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, fanin_builder, ring_id);
+}
+
+static bool compute_deferred_payload_fanin(
+    PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry, PTO2FaninBuilder *fanin_builder,
+    uint8_t ring_id
+) {
+    if (entry.in_manual_scope) {
+        return true;
+    }
+
+    PTO2TaskPayload *payload = entry.payload;
+    for (int32_t i = 0; i < entry.tensor_count; i++) {
+        TensorArgType tag = static_cast<TensorArgType>(entry.tags[i]);
+        if (tag == TensorArgType::OUTPUT) {
+            continue;
+        }
+
+        const Tensor *tensor = &payload->tensors[i];
+        PTO2TaskId owner = tensor->owner_task_id;
+        if (owner.is_valid() && !append_deferred_fanin_or_fail(orch, owner, fanin_builder, ring_id)) {
+            return false;
+        }
+
+        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) {
+            continue;
+        }
+        if (tensor->manual_dep) {
+            continue;
+        }
+
+        bool fatal = false;
+        orch->tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &tm_entry, OverlapStatus overlap_status) -> bool {
+            if (!append_deferred_fanin_or_fail(orch, tm_entry.producer_task_id, fanin_builder, ring_id)) {
+                fatal = true;
+                return false;
+            }
+            if (tag == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                orch->tensor_map.remove_entry(tm_entry);
+            }
+            return true;
+        });
+        if (fatal) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void register_deferred_payload_outputs(PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry) {
+    if (entry.in_manual_scope) {
+        return;
+    }
+    PTO2TaskPayload *payload = entry.payload;
+    for (int32_t i = 0; i < entry.tensor_count; i++) {
+        TensorArgType tag = static_cast<TensorArgType>(entry.tags[i]);
+        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+            const Tensor *tensor = &payload->tensors[i];
+            if (!tensor->manual_dep) {
+                orch->tensor_map.insert(*tensor, entry.task_id);
+            }
+        }
+    }
+}
+
+static bool commit_deferred_submit_entry(PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry) {
+    if (entry.kind == PTO2DeferredSubmitQueue::Kind::SCOPE_END) {
+        if (orch->scheduler != nullptr && entry.scope_count > 0) {
+            orch->scheduler->on_scope_end(entry.scope_slots, entry.scope_count);
+        }
+        return true;
+    }
+
+    write_deferred_submit_descriptor(entry);
+
+    uint8_t ring_id = entry.task_id.ring();
+    PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    orch->tensor_map.sync_tensormap(entry.task_id, sm_last_task_alive);
+
+    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
+    for (int32_t i = 0; i < entry.explicit_dep_count; i++) {
+        PTO2TaskId dep_task_id = entry.explicit_deps[i];
+        if (!dep_task_id.is_valid()) {
+            orch->report_fatal(
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
+            return false;
+        }
+        uint8_t dep_ring_id = dep_task_id.ring();
+        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
+        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
+        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
+        if (dep_local_task_id < dep_last_task_alive) {
+            continue;
+        }
+        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
+        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+        if (!append_fanin_or_fail(
+                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id
+            )) {
+            return false;
+        }
+    }
+
+    if (!compute_deferred_payload_fanin(orch, entry, &fanin_builder, ring_id)) {
+        return false;
+    }
+    register_deferred_payload_outputs(orch, entry);
+
+    PTO2TaskPayload *payload = entry.payload;
+    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
+    payload->fanin_actual_count = fanin_builder.count;
+    payload->fanin_spill_start = fanin_builder.spill_start;
+    payload->fanin_spill_pool = &fanin_builder.spill_pool;
+    for (int32_t i = 0; i < inline_count; i++) {
+        payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+    }
+
+    if (fanin_builder.count == 0) {
+        (void)orch->scheduler->publish_ready_no_fanin(entry.slot_state);
+        return true;
+    }
+    return orch->scheduler->publish_to_wiring_from_orch1(entry.slot_state);
+}
+
 static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator, uint8_t ring_id) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
@@ -555,7 +760,13 @@ void PTO2OrchestratorState::end_scope() {
         orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     }
 
-    if (orch->scheduler && count > 0) {
+    if (orch->scheduler && count > 0 && orch->defer_submit_to_orch1) {
+        if (!enqueue_deferred_scope_end(orch, &orch->scope_tasks[begin], count)) {
+            orch->fatal = true;
+        }
+    } else if (orch->scheduler && count > 0 && orch->scope_end_offload_to_orch1) {
+        orch->scheduler->enqueue_scope_end_offload(&orch->scope_tasks[begin], count);
+    } else if (orch->scheduler && count > 0) {
         orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
     }
 
@@ -631,8 +842,6 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
-
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
 #if PTO2_PROFILING
@@ -641,6 +850,53 @@ static TaskOutputTensors submit_task_common(
         orch->bytes_allocated += layout.total_output_size;
     }
 #endif
+
+#if PTO2_PROFILING
+    if (is_dump_args_enabled()) {
+        if (args.scalar_count() > 0) {
+            set_dump_args_task_scalar_dtypes(
+                task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
+            );
+        }
+        // Selective vs full dump is latched at dump_args_init from DumpDataHeader
+        // (host-decided before any dispatch), so it is race-free regardless of
+        // submission order. Here we only record each marked task's arg mask and
+        // metadata flags, which selective collection consults.
+        if (args.dump_arg_mask() != 0) {
+            set_dump_args_task_mask(task_id.raw, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
+        }
+    }
+#endif
+
+    if (orch->defer_submit_to_orch1) {
+        payload.init(args, result, prepared.alloc_result, layout);
+        CYCLE_COUNT_LAP(g_orch_args_cycle);
+
+        PTO2DeferredSubmitQueue::Entry deferred_entry;
+        if (!fill_deferred_submit_entry(
+                orch, deferred_entry, args, prepared, task_id, aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id
+            )) {
+            return result;
+        }
+        if (!sched->enqueue_deferred_submit(deferred_entry)) {
+            orch->fatal = true;
+            return result;
+        }
+
+        CYCLE_COUNT_LAP(g_orch_fanin_cycle);
+        CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
+
+#if PTO2_PROFILING
+        orch->tasks_submitted++;
+#if PTO2_PROFILING
+        g_orch_submit_count++;
+#endif
+        g_orch_submit_idx++;
+#endif
+        return result;
+    }
+
+    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
 
     // === STEP 2: Sync TensorMap validity and optional cleanup ===
     // Read current last_task_alive from shared memory for this ring
@@ -699,17 +955,6 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_insert_cycle);
 
-    // === STEP 5: Batch-write to GM (single cache line burst) ===
-    // Deferred from allocation phase to avoid scattered GM writes that get
-    // evicted by TensorMap lookup/insert cache pressure.
-    __builtin_prefetch(&task, 1, 1);
-    task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
-    task.packed_buffer_base = prepared.alloc_result.packed_base;
-    task.packed_buffer_end = prepared.alloc_result.packed_end;
-
     // fanout_count was already incremented per live producer inside
     // append_fanin_or_fail, atomically with the consumed/generation check under
     // the producer's fanout_lock. Doing it there (rather than a separate pass
@@ -724,48 +969,90 @@ static TaskOutputTensors submit_task_common(
         payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
 
-    payload.init(args, result, prepared.alloc_result, layout);
+    if (orch->finalize_offload_to_orch1) {
 #if PTO2_PROFILING
-    if (is_dump_args_enabled()) {
-        if (args.scalar_count() > 0) {
-            set_dump_args_task_scalar_dtypes(
-                task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
-            );
-        }
-        // Selective vs full dump is latched at dump_args_init from DumpDataHeader
-        // (host-decided before any dispatch), so it is race-free regardless of
-        // submission order. Here we only record each marked task's arg mask and
-        // metadata flags, which selective collection consults.
-        if (args.dump_arg_mask() != 0) {
-            set_dump_args_task_mask(task_id.raw, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
-        }
-    }
+        uint64_t payload_init_t0 = orch->o_pipeline_profile ? get_sys_cnt_aicpu() : 0;
 #endif
+        payload.init(args, result, prepared.alloc_result, layout);
+#if PTO2_PROFILING
+        uint64_t payload_init_t1 = orch->o_pipeline_profile ? get_sys_cnt_aicpu() : 0;
+        if (orch->o_pipeline_profile) {
+            g_orch_payload_init_cycle += payload_init_t1 - payload_init_t0;
+        }
+        uint64_t finalize_entry_t0 = payload_init_t1;
+#endif
+        bool enqueued = sched->enqueue_finalize_offload_with([&](PTO2FinalizeOffloadQueue::Entry &finalize_entry) {
+                fill_finalize_offload_entry(
+                    finalize_entry, prepared, task_id, aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id,
+                    orch->no_fanin_ready_fastpath
+                );
+            });
+#if PTO2_PROFILING
+        if (orch->o_pipeline_profile) {
+            g_orch_finalize_entry_cycle += get_sys_cnt_aicpu() - finalize_entry_t0;
+        }
+#endif
+        if (!enqueued) {
+            orch->fatal = true;
+            return result;
+        }
+    } else {
+        // === STEP 5: Batch-write to GM (single cache line burst) ===
+        // Deferred from allocation phase to avoid scattered GM writes that get
+        // evicted by TensorMap lookup/insert cache pressure.
+        __builtin_prefetch(&task, 1, 1);
+        task.task_id = task_id;
+        task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+        task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+        task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+        task.packed_buffer_base = prepared.alloc_result.packed_base;
+        task.packed_buffer_end = prepared.alloc_result.packed_end;
+
+#if PTO2_PROFILING
+        uint64_t payload_init_t0 = orch->o_pipeline_profile ? get_sys_cnt_aicpu() : 0;
+#endif
+        payload.init(args, result, prepared.alloc_result, layout);
+#if PTO2_PROFILING
+        if (orch->o_pipeline_profile) {
+            g_orch_payload_init_cycle += get_sys_cnt_aicpu() - payload_init_t0;
+        }
+#endif
+    }
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    if (!sched->wiring.queue.push(&cur_slot_state)) {
-        // producer_blocked is the wiring deadlock detector's "orchestrator is
-        // stuck in push" observable: set ONLY while we actually spin (queue
-        // full), cleared on exit, so the just-filled-then-scope_end case (push
-        // succeeded, no spin) never trips a false deadlock. Also poll the shared
-        // orch_error_code so a fatal latched by any party (e.g. that detector)
-        // breaks this otherwise-unbounded spin and unwinds orchestration.
-        sched->wiring.producer_blocked.store(1, std::memory_order_release);
-        while (!sched->wiring.queue.push(&cur_slot_state)) {
-            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                orch->fatal = true;
+    if (!orch->finalize_offload_to_orch1) {
+        // === STEP 6: publish to scheduler ===
+        //
+        // A zero-fanin task has no fanout edges to wire. Strategy0 can publish it
+        // straight to the ready queue and avoid the wiring queue round-trip; tasks
+        // with dependencies keep the normal deferred wiring path.
+        if (orch->no_fanin_ready_fastpath && fanin_builder.count == 0) {
+            (void)sched->publish_ready_no_fanin(&cur_slot_state);
+        } else {
+            // Deferred wiring: orchestrator only stores dependency metadata and increments
+            // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
+            // is handled asynchronously by scheduler thread 0/Orch1 via the wiring queue.
+            // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+            if (!sched->wiring.queue.push(&cur_slot_state)) {
+                // producer_blocked is the wiring deadlock detector's "orchestrator is
+                // stuck in push" observable: set ONLY while we actually spin (queue
+                // full), cleared on exit, so the just-filled-then-scope_end case (push
+                // succeeded, no spin) never trips a false deadlock. Also poll the shared
+                // orch_error_code so a fatal latched by any party (e.g. that detector)
+                // breaks this otherwise-unbounded spin and unwinds orchestration.
+                sched->wiring.producer_blocked.store(1, std::memory_order_release);
+                while (!sched->wiring.queue.push(&cur_slot_state)) {
+                    if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                        orch->fatal = true;
+                        sched->wiring.producer_blocked.store(0, std::memory_order_release);
+                        return result;
+                    }
+                    SPIN_WAIT_HINT();
+                }
                 sched->wiring.producer_blocked.store(0, std::memory_order_release);
-                return result;
             }
-            SPIN_WAIT_HINT();
         }
-        sched->wiring.producer_blocked.store(0, std::memory_order_release);
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -773,7 +1060,7 @@ static TaskOutputTensors submit_task_common(
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     g_orch_submit_count++;
 #endif
     g_orch_submit_idx++;
@@ -960,13 +1247,38 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     g_orch_submit_count++;
 #endif
     g_orch_submit_idx++;
 #endif
 
     return outputs;
+}
+
+int32_t PTO2OrchestratorState::drain_deferred_submit_to_orch1(int32_t max_entries) {
+    auto *orch = this;
+    if (orch->scheduler == nullptr) {
+        return 0;
+    }
+
+    int32_t processed = 0;
+    for (int32_t n = 0; n < max_entries; n++) {
+        PTO2DeferredSubmitQueue::Entry *entry = orch->scheduler->deferred_submit_queue.pop();
+        if (entry == nullptr) {
+            break;
+        }
+        int32_t processed_units =
+            entry->kind == PTO2DeferredSubmitQueue::Kind::SCOPE_END ? entry->scope_count : 1;
+        bool ok = commit_deferred_submit_entry(orch, *entry);
+        orch->scheduler->deferred_submit_queue.pop_done();
+        if (!ok) {
+            orch->fatal = true;
+            return -1;
+        }
+        processed += processed_units;
+    }
+    return processed;
 }
 
 // =============================================================================
@@ -992,12 +1304,12 @@ void PTO2OrchestratorState::mark_done() {
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-#if !PTO2_ORCH_PROFILING && PTO2_PROFILING
+#if PTO2_PROFILING
     g_orch_submit_idx = 0;
 #endif
 }
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
@@ -1007,6 +1319,8 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.insert_cycle = g_orch_insert_cycle;
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
+    d.payload_init_cycle = g_orch_payload_init_cycle;
+    d.finalize_entry_cycle = g_orch_finalize_entry_cycle;
     d.submit_count = g_orch_submit_count;
     d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
@@ -1018,6 +1332,7 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
+    g_orch_payload_init_cycle = g_orch_finalize_entry_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;
     g_orch_alloc_wait_cycle = 0;

@@ -88,10 +88,12 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
     return LoopAction::NONE;
 }
 
-LoopAction SchedulerContext::handle_core_transition(bool &cores_released) {
+LoopAction SchedulerContext::handle_core_transition(bool &cores_released, bool count_reassign_ack) {
     if (!transition_requested_.load(std::memory_order_acquire)) return LoopAction::NONE;
     if (!reassigned_.load(std::memory_order_acquire)) {
-        wait_reassign_.fetch_add(1, std::memory_order_release);
+        if (count_reassign_ack) {
+            wait_reassign_.fetch_add(1, std::memory_order_release);
+        }
         while (!reassigned_.load(std::memory_order_acquire)) {
             if (completed_.load(std::memory_order_acquire)) {
                 return LoopAction::BREAK_LOOP;
@@ -868,6 +870,8 @@ int32_t SchedulerContext::init(
     sched_thread_num_ = sched_thread_num;
     orch_to_sched_ = orch_to_sched;
     external_wiring_ = external_wiring;
+    wire_to_sched_ = external_wiring_ && !orch_to_sched_ &&
+                     runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_FINALIZE_PIPELINE;
     regs_ = regs_base;
 
 #if PTO2_PROFILING
@@ -890,7 +894,7 @@ int32_t SchedulerContext::init(
             // sched pools and all sched_phase emits would silently drop.
             const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
             int sched_phase_threads = active_sched;
-            if (orch_to_sched_) {
+            if (orch_to_sched_ || wire_to_sched_) {
                 sched_phase_threads = sched_thread_num_ + 1;
                 if (sched_phase_threads > aicpu_thread_num_) {
                     sched_phase_threads = aicpu_thread_num_;
@@ -925,7 +929,7 @@ int32_t SchedulerContext::init(
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
         int dump_threads = active_sched_threads_;
-        if (orch_to_sched_) {
+        if (orch_to_sched_ || wire_to_sched_) {
             dump_threads = sched_thread_num_ + 1;
             if (dump_threads > aicpu_thread_num_) {
                 dump_threads = aicpu_thread_num_;
@@ -1032,6 +1036,7 @@ void SchedulerContext::deinit() {
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
     external_wiring_ = false;
+    wire_to_sched_ = false;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
@@ -1093,12 +1098,18 @@ void SchedulerContext::on_orchestration_done(
         // Signal transition to unblock scheduler threads waiting at core transition
         transition_requested_.store(true, std::memory_order_release);
         reassigned_.store(true, std::memory_order_release);
-    } else if (orch_to_sched_) {
-        LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
+    } else if (orch_to_sched_ || wire_to_sched_) {
+        LOG_INFO_V0(
+            "Thread %d: Set orchestrator_done=true, requesting core transition (orch_to_sched=%d wire_to_sched=%d)",
+            thread_idx, orch_to_sched_ ? 1 : 0, wire_to_sched_ ? 1 : 0
+        );
         transition_requested_.store(true, std::memory_order_release);
 
-        // Wait for scheduler threads to acknowledge transition request
-        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
+        // Wait for all threads that can touch scheduler/core-tracker state during
+        // reassignment. In wire_to_sched mode Orch1 is already running the
+        // scheduler loop, so it also parks here before O0 mutates core ownership.
+        const int32_t transition_waiters = sched_thread_num_ + (wire_to_sched_ ? 1 : 0);
+        while (wait_reassign_.load(std::memory_order_acquire) != transition_waiters) {
             if (completed_.load(std::memory_order_acquire)) {
                 break;
             }

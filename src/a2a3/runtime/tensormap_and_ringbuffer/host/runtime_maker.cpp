@@ -436,11 +436,38 @@ extern "C" int bind_callable_to_runtime_impl(
             }
         }
         runtime->orch1_wire_force_drain = false;
-        if (runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE) {
+        runtime->orch1_scope_end_offload = false;
+        runtime->orch1_finalize_offload = false;
+        runtime->o_pipeline_profile = false;
+        const char *profile_env = std::getenv("SIMPLER_O_PIPELINE_PROFILE");
+        if (profile_env != nullptr &&
+            (profile_env[0] == '1' || profile_env[0] == 't' || profile_env[0] == 'T')) {
+            runtime->o_pipeline_profile = true;
+        }
+        bool finalize_pipeline =
+            runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_FINALIZE_PIPELINE;
+        bool orch1_pipeline = runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE ||
+                              finalize_pipeline;
+        if (orch1_pipeline) {
             const char *force_env = std::getenv("SIMPLER_ORCH1_WIRE_FORCE_DRAIN");
             if (force_env != nullptr &&
                 (force_env[0] == '1' || force_env[0] == 't' || force_env[0] == 'T')) {
                 runtime->orch1_wire_force_drain = true;
+            }
+
+            runtime->orch1_finalize_offload = finalize_pipeline;
+            if (runtime->pipeline_strategy == RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE) {
+                const char *scope_env = std::getenv("SIMPLER_ORCH1_SCOPE_END_OFFLOAD");
+                if (scope_env != nullptr &&
+                    (scope_env[0] == '1' || scope_env[0] == 't' || scope_env[0] == 'T')) {
+                    runtime->orch1_scope_end_offload = true;
+                }
+
+                const char *finalize_env = std::getenv("SIMPLER_ORCH1_FINALIZE_OFFLOAD");
+                if (finalize_env != nullptr &&
+                    (finalize_env[0] == '1' || finalize_env[0] == 't' || finalize_env[0] == 'T')) {
+                    runtime->orch1_finalize_offload = true;
+                }
             }
 
             const char *post_sched_env = std::getenv("SIMPLER_ORCH1_POST_SCHED");
@@ -449,8 +476,11 @@ extern "C" int bind_callable_to_runtime_impl(
                 runtime->orch_to_sched = true;
             }
             LOG_INFO_V0(
-                "Pipeline strategy %d: orch1_wire_force_drain=%d, post_sched=%d", runtime->pipeline_strategy,
-                runtime->orch1_wire_force_drain ? 1 : 0, runtime->orch_to_sched ? 1 : 0
+                "Pipeline strategy %d: orch1_wire_force_drain=%d, orch1_scope_end_offload=%d, "
+                "orch1_finalize_offload=%d, finalize_pipeline=%d, o_pipeline_profile=%d, post_sched=%d",
+                runtime->pipeline_strategy, runtime->orch1_wire_force_drain ? 1 : 0,
+                runtime->orch1_scope_end_offload ? 1 : 0, runtime->orch1_finalize_offload ? 1 : 0,
+                finalize_pipeline ? 1 : 0, runtime->o_pipeline_profile ? 1 : 0, runtime->orch_to_sched ? 1 : 0
             );
         }
         LOG_INFO_V0("Pipeline strategy: %d", runtime->pipeline_strategy);

@@ -768,15 +768,134 @@ int32_t SchedulerContext::resolve_wiring(Runtime *runtime, int32_t thread_idx, b
     LOG_INFO_V0("Thread %d: resolve_wiring entry", thread_idx);
 
 #if PTO2_PROFILING
+    bool pipeline_profile = runtime != nullptr && runtime->o_pipeline_profile;
     uint64_t wire_start_ts = get_sys_cnt_aicpu();
+    uint64_t wire_active_cycle = 0;
+    uint64_t deferred_active_cycle = 0;
+    uint64_t finalize_phase_cycle = 0;
+    uint64_t finalize_descriptor_cycle = 0;
+    uint64_t finalize_publish_cycle = 0;
+    uint64_t wiring_active_cycle = 0;
+    uint64_t scope_active_cycle = 0;
+    uint32_t wire_drain_hits = 0;
+    uint32_t wire_drain_misses = 0;
 #endif
     int32_t wired_total = 0;
+    int32_t deferred_total = 0;
+    int32_t finalized_total = 0;
+    int32_t finalized_direct_ready_total = 0;
+    int32_t finalized_direct_wired_total = 0;
+    int32_t finalized_to_wiring_total = 0;
+    int32_t scope_released_total = 0;
     int32_t idle_iterations = 0;
 
-    while (!completed_.load(std::memory_order_acquire)) {
+    while (!completed_.load(std::memory_order_acquire) || !sched_->deferred_submit_queue.empty() ||
+           !sched_->finalize_offload_queue.empty() ||
+           !sched_->scope_end_offload_queue.empty()) {
+#if PTO2_PROFILING
+        uint64_t loop_active_cycle = 0;
+#endif
+        bool did_work = false;
+        int32_t deferred = 0;
+        if (rt_ != nullptr) {
+#if PTO2_PROFILING
+            uint64_t phase_t0 = get_sys_cnt_aicpu();
+#endif
+            deferred = rt_->orchestrator.drain_deferred_submit_to_orch1(/*max_entries=*/8);
+#if PTO2_PROFILING
+            uint64_t phase_t1 = get_sys_cnt_aicpu();
+            if (deferred > 0) {
+                loop_active_cycle += phase_t1 - phase_t0;
+                deferred_active_cycle += phase_t1 - phase_t0;
+            }
+#endif
+            if (deferred < 0) {
+                break;
+            }
+        }
+        if (deferred > 0) {
+            deferred_total += deferred;
+            did_work = true;
+        }
+
+#if PTO2_PROFILING
+        uint64_t finalize_t0 = get_sys_cnt_aicpu();
+        PTO2FinalizeOffloadDrainStats finalize_stats;
+#endif
+        int32_t finalized = sched_->drain_finalize_offload(
+            /*max_entries=*/8
+#if PTO2_PROFILING
+            ,
+            pipeline_profile ? &finalize_stats : nullptr
+#endif
+        );
+#if PTO2_PROFILING
+        uint64_t finalize_t1 = get_sys_cnt_aicpu();
+        if (finalized > 0) {
+            loop_active_cycle += finalize_t1 - finalize_t0;
+            if (pipeline_profile) {
+                finalize_phase_cycle += finalize_t1 - finalize_t0;
+                finalize_descriptor_cycle += finalize_stats.descriptor_cycle;
+                finalize_publish_cycle += finalize_stats.publish_cycle;
+            }
+        }
+#endif
+        if (finalized < 0) {
+            break;
+        }
+        if (finalized > 0) {
+            finalized_total += finalized;
+#if PTO2_PROFILING
+            if (pipeline_profile) {
+                finalized_direct_ready_total += finalize_stats.direct_ready;
+                finalized_direct_wired_total += finalize_stats.direct_wired;
+                finalized_to_wiring_total += finalize_stats.to_wiring;
+            }
+#endif
+            did_work = true;
+        }
+
+#if PTO2_PROFILING
+        uint64_t wiring_t0 = get_sys_cnt_aicpu();
+#endif
         int wired = sched_->drain_wiring_queue(force_drain || orchestrator_done_);
+#if PTO2_PROFILING
+        uint64_t wiring_t1 = get_sys_cnt_aicpu();
+        if (wired > 0) {
+            loop_active_cycle += wiring_t1 - wiring_t0;
+            wiring_active_cycle += wiring_t1 - wiring_t0;
+        }
+#endif
         if (wired > 0) {
             wired_total += wired;
+            did_work = true;
+        }
+
+#if PTO2_PROFILING
+        uint64_t scope_t0 = get_sys_cnt_aicpu();
+#endif
+        int32_t scope_released = sched_->drain_scope_end_offload(did_work ? 1 : 2);
+#if PTO2_PROFILING
+        uint64_t scope_t1 = get_sys_cnt_aicpu();
+        if (scope_released > 0) {
+            loop_active_cycle += scope_t1 - scope_t0;
+            scope_active_cycle += scope_t1 - scope_t0;
+        }
+#endif
+        if (scope_released > 0) {
+            scope_released_total += scope_released;
+            did_work = true;
+        }
+
+#if PTO2_PROFILING
+        if (did_work) {
+            wire_active_cycle += loop_active_cycle;
+            wire_drain_hits++;
+        } else {
+            wire_drain_misses++;
+        }
+#endif
+        if (did_work) {
             idle_iterations = 0;
             continue;
         }
@@ -792,12 +911,42 @@ int32_t SchedulerContext::resolve_wiring(Runtime *runtime, int32_t thread_idx, b
 #if PTO2_PROFILING
     uint64_t wire_end_ts = get_sys_cnt_aicpu();
     LOG_INFO_V9(
-        "Thread %d: wire_start=%" PRIu64 " wire_end=%" PRIu64 " wire_cost=%.3fus wired=%d", thread_idx,
+        "Thread %d: wire_start=%" PRIu64 " wire_end=%" PRIu64
+        " wire_cost=%.3fus wire_active_cost=%.3fus wire_idle_cost=%.3fus wired=%d"
+        " deferred=%d finalized=%d direct_ready=%d direct_wired=%d fallback_wiring=%d scope_released=%d"
+        " wire_hits=%u wire_misses=%u",
+        thread_idx,
         static_cast<uint64_t>(wire_start_ts), static_cast<uint64_t>(wire_end_ts),
-        cycles_to_us(wire_end_ts - wire_start_ts), wired_total
+        cycles_to_us(wire_end_ts - wire_start_ts), cycles_to_us(wire_active_cycle),
+        cycles_to_us((wire_end_ts - wire_start_ts) - wire_active_cycle), wired_total, deferred_total,
+        finalized_total, finalized_direct_ready_total, finalized_direct_wired_total, finalized_to_wiring_total,
+        scope_released_total, wire_drain_hits, wire_drain_misses
     );
+    if (pipeline_profile) {
+        LOG_INFO_V9(
+            "Thread %d: === Orch1/Wire Profiling: total_active=%.3fus ===", thread_idx,
+            cycles_to_us(wire_active_cycle)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   deferred_submit: %.3fus", thread_idx, cycles_to_us(deferred_active_cycle)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   finalize_total : %.3fus  descriptor=%.3fus publish_or_wire=%.3fus", thread_idx,
+            cycles_to_us(finalize_phase_cycle), cycles_to_us(finalize_descriptor_cycle),
+            cycles_to_us(finalize_publish_cycle)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   wire_queue     : %.3fus", thread_idx, cycles_to_us(wiring_active_cycle)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   scope_end      : %.3fus", thread_idx, cycles_to_us(scope_active_cycle)
+        );
+    }
 #endif
-    LOG_INFO_V0("Thread %d: resolve_wiring exit, wired=%d", thread_idx, wired_total);
+    LOG_INFO_V0(
+        "Thread %d: resolve_wiring exit, wired=%d, deferred=%d, finalized=%d, scope_released=%d", thread_idx,
+        wired_total, deferred_total, finalized_total, scope_released_total
+    );
     return wired_total;
 }
 
@@ -853,6 +1002,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // Cached at function scope: is_pmu_enabled() is extern "C" and the
     // compiler cannot hoist it across the dispatch loop on its own.
     const bool pmu_active = is_pmu_enabled();
+    const bool is_wire_sched_helper = wire_to_sched_ && thread_idx == sched_thread_num_;
 
 #if PTO2_PROFILING
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
@@ -948,7 +1098,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (action == LoopAction::BREAK_LOOP) break;
         }
 
-        if (!cores_released && orch_to_sched_) {
+        if (!cores_released && (orch_to_sched_ || wire_to_sched_)) {
             LoopAction action = handle_core_transition(cores_released);
             if (action == LoopAction::BREAK_LOOP) break;
         }
@@ -1058,9 +1208,50 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Phase 3: Drain wiring queue (thread 0 only)
+        // Phase 3: Drain wiring queue. In Orch1-helper mode, O1 keeps ownership
+        // of the O1 queues and can later join dispatch after core reassignment.
         int wired = 0;
-        if (!external_wiring_ && thread_idx == 0) {
+        if (is_wire_sched_helper) {
+            bool o1_did_work = false;
+            int32_t deferred = 0;
+            if (rt_ != nullptr) {
+                deferred = rt_->orchestrator.drain_deferred_submit_to_orch1(/*max_entries=*/8);
+                if (deferred < 0) {
+                    timeout_rc = deferred;
+                    break;
+                }
+            }
+            if (deferred > 0) {
+                o1_did_work = true;
+            }
+
+            int32_t finalized = sched_->drain_finalize_offload(/*max_entries=*/8);
+            if (finalized < 0) {
+                timeout_rc = finalized;
+                break;
+            }
+            if (finalized > 0) {
+                o1_did_work = true;
+            }
+
+            const bool force_drain = (runtime != nullptr && runtime->orch1_wire_force_drain) || orchestrator_done_;
+            wired = sched_->drain_wiring_queue(force_drain);
+            if (wired > 0) {
+                o1_did_work = true;
+                made_progress = true;
+#if PTO2_SCHED_PROFILING
+                l2_swimlane.phase_wiring_count += wired;
+#endif
+            }
+
+            int32_t scope_released = sched_->drain_scope_end_offload(o1_did_work ? 1 : 2);
+            if (scope_released > 0) {
+                o1_did_work = true;
+            }
+            if (o1_did_work) {
+                made_progress = true;
+            }
+        } else if (!external_wiring_ && thread_idx == 0) {
             wired = sched_->drain_wiring_queue(orchestrator_done_);
             if (wired > 0) {
                 made_progress = true;
@@ -1090,13 +1281,15 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-        // Phase 3b: Drain dummy ready queue (thread 0 only).
+        // Phase 3b: Drain dummy ready queue.
         //
         // Dependency-only tasks bypass AICore dispatch: they go through the
         // scheduler so fanin/fanout edges stay consistent, but completion is
-        // signalled inline here. Pinned to thread 0 to avoid cross-thread
-        // races and to keep cache hot near the wiring drain above.
-        if (thread_idx == 0) {
+        // signalled inline here. Baseline keeps the historical S0-only drain.
+        // With external wiring, normal wiring has moved to Orch1, so all active
+        // scheduler threads may help drain dummy tasks and resolve their fanout.
+        bool drain_dummy_on_this_thread = external_wiring_ || thread_idx == 0;
+        if (drain_dummy_on_this_thread) {
             constexpr int DUMMY_DRAIN_BATCH = 16;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);

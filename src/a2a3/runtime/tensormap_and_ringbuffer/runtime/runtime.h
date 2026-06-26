@@ -60,8 +60,15 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 // -1 preserves the upstream baseline: one Orch thread + N scheduler threads,
 // with Scheduler0 draining the wiring queue.
 // 0 splits Scheduler0's normal wiring drain into a dedicated Orch1 wire thread.
+// 1 keeps dependency/fanin construction on O0 and offloads the finalize +
+// publish tail to Orch1, preserving the no-fanin direct-ready fast path.
 constexpr int32_t RUNTIME_PIPELINE_STRATEGY_BASELINE = -1;
 constexpr int32_t RUNTIME_PIPELINE_STRATEGY_ORCH1_WIRE = 0;
+constexpr int32_t RUNTIME_PIPELINE_STRATEGY_ORCH1_FINALIZE_PIPELINE = 1;
+// Legacy name kept so older experimental code still compiles; strategy 1 no
+// longer defers TensorMap dependency construction to Orch1.
+constexpr int32_t RUNTIME_PIPELINE_STRATEGY_ORCH1_DEFERRED_SUBMIT =
+    RUNTIME_PIPELINE_STRATEGY_ORCH1_FINALIZE_PIPELINE;
 
 // =============================================================================
 // Data Structures
@@ -210,6 +217,9 @@ public:
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
     int32_t pipeline_strategy;
     bool orch1_wire_force_drain;
+    bool orch1_scope_end_offload;
+    bool orch1_finalize_offload;
+    bool o_pipeline_profile;
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose

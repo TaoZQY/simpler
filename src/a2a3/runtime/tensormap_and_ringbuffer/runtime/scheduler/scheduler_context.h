@@ -162,6 +162,7 @@ private:
     int32_t sched_thread_num_{0};
     bool orch_to_sched_{false};
     bool external_wiring_{false};
+    bool wire_to_sched_{false};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
@@ -360,7 +361,8 @@ private:
     __attribute__((noinline, cold)) LoopAction
     handle_orchestrator_exit(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count);
 
-    __attribute__((noinline, cold)) LoopAction handle_core_transition(bool &cores_released);
+    __attribute__((noinline, cold)) LoopAction
+    handle_core_transition(bool &cores_released, bool count_reassign_ack = true);
 
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime);
