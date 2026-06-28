@@ -560,8 +560,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt->scheduler.deferred_submit_queue.reset();
             rt->orchestrator.no_fanin_ready_fastpath = external_wiring_;
             rt->orchestrator.scope_end_offload_to_orch1 = external_wiring_ && runtime->orch1_scope_end_offload;
-            rt->orchestrator.finalize_offload_to_orch1 = external_wiring_ && runtime->orch1_finalize_offload;
-            rt->orchestrator.defer_submit_to_orch1 = false;
+            rt->orchestrator.defer_submit_to_orch1 = finalize_pipeline_;
+            rt->orchestrator.finalize_offload_to_orch1 =
+                external_wiring_ && runtime->orch1_finalize_offload && !rt->orchestrator.defer_submit_to_orch1;
             rt->orchestrator.o_pipeline_profile = runtime->o_pipeline_profile;
 #if PTO2_PROFILING
             rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();

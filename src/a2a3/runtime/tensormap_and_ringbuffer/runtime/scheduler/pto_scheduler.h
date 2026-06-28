@@ -550,7 +550,6 @@ static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 
 struct alignas(64) PTO2DeferredSubmitQueue {
     static constexpr uint32_t CAPACITY = 128;  // power of two
     static constexpr uint32_t MASK = CAPACITY - 1;
-    static constexpr int32_t EXPLICIT_DEP_CAP = 64;
     static constexpr int32_t SCOPE_CHUNK_SIZE = 32;
 
     enum class Kind : uint8_t {
@@ -571,21 +570,21 @@ struct alignas(64) PTO2DeferredSubmitQueue {
 
         int32_t tensor_count{0};
         uint8_t tags[MAX_TENSOR_ARGS]{};
-        int32_t explicit_dep_count{0};
-        PTO2TaskId explicit_deps[EXPLICIT_DEP_CAP]{};
         bool in_manual_scope{false};
 
         int32_t scope_count{0};
-        PTO2TaskSlotState *scope_slots[SCOPE_CHUNK_SIZE]{};
     };
 
     alignas(64) std::atomic<uint32_t> head{0};
     alignas(64) std::atomic<uint32_t> tail{0};
+    alignas(64) std::atomic<uint32_t> committed{0};
     alignas(64) Entry entries[CAPACITY];
+    alignas(64) PTO2TaskSlotState *scope_slots[CAPACITY][SCOPE_CHUNK_SIZE];
 
     void reset() {
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
+        committed.store(0, std::memory_order_relaxed);
     }
 
     bool push(const Entry &src) {
@@ -599,6 +598,35 @@ struct alignas(64) PTO2DeferredSubmitQueue {
         return true;
     }
 
+    template <typename FillFn>
+    bool push_with(FillFn &&fill) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        fill(entries[h & MASK]);
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool push_scope_chunk(PTO2TaskSlotState **slots, int32_t count) {
+        uint32_t h = head.load(std::memory_order_relaxed);
+        uint32_t t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAPACITY) {
+            return false;
+        }
+        uint32_t idx = h & MASK;
+        Entry &entry = entries[idx];
+        entry.kind = Kind::SCOPE_END;
+        entry.scope_count = count;
+        for (int32_t i = 0; i < count; i++) {
+            scope_slots[idx][i] = slots[i];
+        }
+        head.store(h + 1, std::memory_order_release);
+        return true;
+    }
+
     Entry *pop() {
         uint32_t t = tail.load(std::memory_order_relaxed);
         uint32_t h = head.load(std::memory_order_acquire);
@@ -608,10 +636,18 @@ struct alignas(64) PTO2DeferredSubmitQueue {
         return &entries[t & MASK];
     }
 
+    PTO2TaskSlotState **pop_scope_slots() { return scope_slots[tail.load(std::memory_order_relaxed) & MASK]; }
+
     void pop_done() {
         uint32_t t = tail.load(std::memory_order_relaxed);
         tail.store(t + 1, std::memory_order_release);
     }
+
+    void commit_done() { committed.fetch_add(1, std::memory_order_release); }
+
+    uint32_t submitted_count() const { return head.load(std::memory_order_acquire); }
+
+    uint32_t committed_count() const { return committed.load(std::memory_order_acquire); }
 
     bool empty() const {
         return tail.load(std::memory_order_acquire) == head.load(std::memory_order_acquire);
@@ -1195,6 +1231,41 @@ struct PTO2SchedulerState {
         }
         wiring.producer_blocked.store(1, std::memory_order_release);
         while (!deferred_submit_queue.push(entry)) {
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                wiring.producer_blocked.store(0, std::memory_order_release);
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        wiring.producer_blocked.store(0, std::memory_order_release);
+        return true;
+    }
+
+    template <typename FillFn>
+    bool enqueue_deferred_submit_with(FillFn &&fill) {
+        if (deferred_submit_queue.push_with(fill)) {
+            return true;
+        }
+        wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!deferred_submit_queue.push_with(fill)) {
+            if (sm_header != nullptr &&
+                sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                wiring.producer_blocked.store(0, std::memory_order_release);
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+        wiring.producer_blocked.store(0, std::memory_order_release);
+        return true;
+    }
+
+    bool enqueue_deferred_submit_scope_chunk(PTO2TaskSlotState **slots, int32_t count) {
+        if (deferred_submit_queue.push_scope_chunk(slots, count)) {
+            return true;
+        }
+        wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!deferred_submit_queue.push_scope_chunk(slots, count)) {
             if (sm_header != nullptr &&
                 sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
                 wiring.producer_blocked.store(0, std::memory_order_release);

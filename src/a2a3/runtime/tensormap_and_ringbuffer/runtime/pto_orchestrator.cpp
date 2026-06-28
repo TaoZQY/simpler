@@ -367,19 +367,14 @@ static void fill_finalize_offload_entry(
 }
 
 static bool fill_deferred_submit_entry(
-    PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry, const L0TaskArgs &args,
-    PTO2PreparedTask &prepared, PTO2TaskId task_id, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
-    int32_t aiv1_kernel_id
+    PTO2DeferredSubmitQueue::Entry &entry, const L0TaskArgs &args, PTO2PreparedTask &prepared,
+    PTO2TaskId task_id, int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
-    if (args.explicit_dep_count() > PTO2DeferredSubmitQueue::EXPLICIT_DEP_CAP) {
-        orch->report_fatal(
-            PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "explicit dependency count %u exceeds deferred submit cap %d",
-            args.explicit_dep_count(), PTO2DeferredSubmitQueue::EXPLICIT_DEP_CAP
-        );
-        return false;
-    }
+    always_assert(args.explicit_dep_count() == 0 && "deferred submit only supports tasks without explicit deps");
 
-    entry = PTO2DeferredSubmitQueue::Entry{};
+    // TASK entries overwrite every field consumed by the TASK commit path.
+    // Scope-only fields are ignored when kind == TASK, so avoid clearing the
+    // whole union-like record on O0's hot submit path.
     entry.kind = PTO2DeferredSubmitQueue::Kind::TASK;
     entry.slot_state = prepared.slot_state;
     entry.task = prepared.task;
@@ -391,14 +386,55 @@ static bool fill_deferred_submit_entry(
     entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
     entry.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
     entry.tensor_count = args.tensor_count();
-    entry.explicit_dep_count = static_cast<int32_t>(args.explicit_dep_count());
-    entry.in_manual_scope = orch->in_manual_scope();
+    entry.in_manual_scope = false;
     for (int32_t i = 0; i < entry.tensor_count; i++) {
         entry.tags[i] = static_cast<uint8_t>(args.tag(i));
     }
-    for (int32_t i = 0; i < entry.explicit_dep_count; i++) {
-        entry.explicit_deps[i] = args.explicit_dep(static_cast<uint32_t>(i));
+    return true;
+}
+
+static bool should_defer_submit_to_orch1(PTO2OrchestratorState *orch, const L0TaskArgs &args) {
+    if (!orch->defer_submit_to_orch1) {
+        return false;
     }
+    if (orch->in_manual_scope()) {
+        return false;
+    }
+    if (args.explicit_dep_count() > 0) {
+        return false;
+    }
+    if (args.tensor_count() > 4) {
+        return false;
+    }
+    return true;
+}
+
+static bool wait_deferred_submit_committed(PTO2OrchestratorState *orch) {
+    if (orch->scheduler == nullptr) {
+        return true;
+    }
+    PTO2DeferredSubmitQueue &queue = orch->scheduler->deferred_submit_queue;
+    uint32_t target = queue.submitted_count();
+    while (queue.committed_count() != target) {
+        if (orch->sm_header != nullptr &&
+            orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+            orch->fatal = true;
+            return false;
+        }
+        SPIN_WAIT_HINT();
+    }
+    return true;
+}
+
+static bool finish_deferred_submit_stage(PTO2OrchestratorState *orch) {
+    if (!orch->defer_submit_to_orch1) {
+        return true;
+    }
+    if (!wait_deferred_submit_committed(orch)) {
+        return false;
+    }
+    orch->defer_submit_to_orch1 = false;
+    orch->finalize_offload_to_orch1 = true;
     return true;
 }
 
@@ -414,13 +450,7 @@ static bool enqueue_deferred_scope_end(
         if (chunk > PTO2DeferredSubmitQueue::SCOPE_CHUNK_SIZE) {
             chunk = PTO2DeferredSubmitQueue::SCOPE_CHUNK_SIZE;
         }
-        PTO2DeferredSubmitQueue::Entry entry{};
-        entry.kind = PTO2DeferredSubmitQueue::Kind::SCOPE_END;
-        entry.scope_count = chunk;
-        for (int32_t i = 0; i < chunk; i++) {
-            entry.scope_slots[i] = task_slot_states[offset + i];
-        }
-        if (!orch->scheduler->enqueue_deferred_submit(entry)) {
+        if (!orch->scheduler->enqueue_deferred_submit_scope_chunk(task_slot_states + offset, chunk)) {
             return false;
         }
         offset += chunk;
@@ -513,10 +543,58 @@ static void register_deferred_payload_outputs(PTO2OrchestratorState *orch, PTO2D
     }
 }
 
-static bool commit_deferred_submit_entry(PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry) {
+static void sync_deferred_submit_entries(
+    PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry *entries, int32_t count
+) {
+    bool ring_seen[PTO2_MAX_RING_DEPTH] = {};
+    for (int32_t i = 0; i < count; i++) {
+        if (entries[i].kind != PTO2DeferredSubmitQueue::Kind::TASK) {
+            continue;
+        }
+        ring_seen[entries[i].task_id.ring()] = true;
+    }
+
+    for (int32_t ring_id = 0; ring_id < PTO2_MAX_RING_DEPTH; ring_id++) {
+        if (!ring_seen[ring_id]) {
+            continue;
+        }
+        PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        orch->tensor_map.sync_validity(ring_id, sm_last_task_alive);
+
+        bool needs_cleanup =
+            sm_last_task_alive - orch->tensor_map.last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL;
+        if (!needs_cleanup) {
+            uint32_t cleanup_slot = orch->tensor_map.get_task_local_id_slot(
+                static_cast<uint8_t>(ring_id), static_cast<uint32_t>(orch->tensor_map.last_cleanup[ring_id])
+            );
+            for (int32_t i = 0; i < count; i++) {
+                if (entries[i].kind != PTO2DeferredSubmitQueue::Kind::TASK ||
+                    entries[i].task_id.ring() != ring_id) {
+                    continue;
+                }
+                if (orch->tensor_map.get_task_local_id_slot(
+                        static_cast<uint8_t>(ring_id), static_cast<uint32_t>(entries[i].task_id.local())
+                    ) == cleanup_slot) {
+                    needs_cleanup = true;
+                    break;
+                }
+            }
+        }
+        if (needs_cleanup) {
+            orch->tensor_map.cleanup_retired(ring_id, orch->tensor_map.last_cleanup[ring_id], sm_last_task_alive);
+            orch->tensor_map.last_cleanup[ring_id] = sm_last_task_alive;
+        }
+    }
+}
+
+static bool commit_deferred_submit_entry(
+    PTO2OrchestratorState *orch, PTO2DeferredSubmitQueue::Entry &entry, bool sync_tensormap = true,
+    PTO2TaskSlotState **scope_slots = nullptr
+) {
     if (entry.kind == PTO2DeferredSubmitQueue::Kind::SCOPE_END) {
         if (orch->scheduler != nullptr && entry.scope_count > 0) {
-            orch->scheduler->on_scope_end(entry.scope_slots, entry.scope_count);
+            orch->scheduler->on_scope_end(scope_slots, entry.scope_count);
         }
         return true;
     }
@@ -524,35 +602,13 @@ static bool commit_deferred_submit_entry(PTO2OrchestratorState *orch, PTO2Deferr
     write_deferred_submit_descriptor(entry);
 
     uint8_t ring_id = entry.task_id.ring();
-    PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-    orch->tensor_map.sync_tensormap(entry.task_id, sm_last_task_alive);
-
-    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
-    for (int32_t i = 0; i < entry.explicit_dep_count; i++) {
-        PTO2TaskId dep_task_id = entry.explicit_deps[i];
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
-            return false;
-        }
-        uint8_t dep_ring_id = dep_task_id.ring();
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (dep_local_task_id < dep_last_task_alive) {
-            continue;
-        }
-        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(
-                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id
-            )) {
-            return false;
-        }
+    if (sync_tensormap) {
+        PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        orch->tensor_map.sync_tensormap(entry.task_id, sm_last_task_alive);
     }
 
+    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
     if (!compute_deferred_payload_fanin(orch, entry, &fanin_builder, ring_id)) {
         return false;
     }
@@ -868,17 +924,17 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    if (orch->defer_submit_to_orch1) {
+    bool defer_submit = should_defer_submit_to_orch1(orch, args);
+    if (defer_submit) {
         payload.init(args, result, prepared.alloc_result, layout);
         CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-        PTO2DeferredSubmitQueue::Entry deferred_entry;
-        if (!fill_deferred_submit_entry(
-                orch, deferred_entry, args, prepared, task_id, aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id
-            )) {
-            return result;
-        }
-        if (!sched->enqueue_deferred_submit(deferred_entry)) {
+        if (!sched->enqueue_deferred_submit_with([&](PTO2DeferredSubmitQueue::Entry &deferred_entry) {
+                bool ok = fill_deferred_submit_entry(
+                    deferred_entry, args, prepared, task_id, aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id
+                );
+                always_assert(ok && "deferred submit entry fill failed after should_defer_submit_to_orch1");
+            })) {
             orch->fatal = true;
             return result;
         }
@@ -894,6 +950,17 @@ static TaskOutputTensors submit_task_common(
         g_orch_submit_idx++;
 #endif
         return result;
+    }
+
+    if (orch->defer_submit_to_orch1) {
+        if (!finish_deferred_submit_stage(orch)) {
+            return result;
+        }
+#if PTO2_PROFILING
+        if (_prof_active) {
+            _t0 = get_sys_cnt_aicpu();
+        }
+#endif
     }
 
     PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
@@ -1188,6 +1255,17 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
     CYCLE_COUNT_START();
 
+    if (orch->defer_submit_to_orch1) {
+        if (!finish_deferred_submit_stage(orch)) {
+            return TaskOutputTensors{};
+        }
+#if PTO2_PROFILING
+        if (_prof_active) {
+            _t0 = get_sys_cnt_aicpu();
+        }
+#endif
+    }
+
     if (args.has_error) {
         report_fatal(
             PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
@@ -1263,20 +1341,54 @@ int32_t PTO2OrchestratorState::drain_deferred_submit_to_orch1(int32_t max_entrie
     }
 
     int32_t processed = 0;
-    for (int32_t n = 0; n < max_entries; n++) {
+    constexpr int32_t kLocalBatchCap = 16;
+    PTO2DeferredSubmitQueue::Entry batch[kLocalBatchCap];
+    int32_t batch_count = 0;
+    int32_t limit = max_entries < kLocalBatchCap ? max_entries : kLocalBatchCap;
+
+    for (int32_t n = 0; n < limit; n++) {
         PTO2DeferredSubmitQueue::Entry *entry = orch->scheduler->deferred_submit_queue.pop();
         if (entry == nullptr) {
             break;
         }
-        int32_t processed_units =
-            entry->kind == PTO2DeferredSubmitQueue::Kind::SCOPE_END ? entry->scope_count : 1;
-        bool ok = commit_deferred_submit_entry(orch, *entry);
-        orch->scheduler->deferred_submit_queue.pop_done();
-        if (!ok) {
-            orch->fatal = true;
-            return -1;
+
+        if (entry->kind == PTO2DeferredSubmitQueue::Kind::SCOPE_END) {
+            if (batch_count > 0) {
+                break;
+            }
+            PTO2DeferredSubmitQueue::Entry scope_entry = *entry;
+            PTO2TaskSlotState *scope_slots[PTO2DeferredSubmitQueue::SCOPE_CHUNK_SIZE];
+            PTO2TaskSlotState **queue_scope_slots = orch->scheduler->deferred_submit_queue.pop_scope_slots();
+            for (int32_t i = 0; i < scope_entry.scope_count; i++) {
+                scope_slots[i] = queue_scope_slots[i];
+            }
+            orch->scheduler->deferred_submit_queue.pop_done();
+            int32_t processed_units = scope_entry.scope_count;
+            bool ok = commit_deferred_submit_entry(orch, scope_entry, /*sync_tensormap=*/true, scope_slots);
+            if (!ok) {
+                orch->fatal = true;
+                return -1;
+            }
+            orch->scheduler->deferred_submit_queue.commit_done();
+            processed += processed_units;
+            continue;
         }
-        processed += processed_units;
+
+        batch[batch_count++] = *entry;
+        orch->scheduler->deferred_submit_queue.pop_done();
+    }
+
+    if (batch_count > 0) {
+        sync_deferred_submit_entries(orch, batch, batch_count);
+        for (int32_t i = 0; i < batch_count; i++) {
+            bool ok = commit_deferred_submit_entry(orch, batch[i], /*sync_tensormap=*/false);
+            if (!ok) {
+                orch->fatal = true;
+                return -1;
+            }
+            orch->scheduler->deferred_submit_queue.commit_done();
+            processed++;
+        }
     }
     return processed;
 }
