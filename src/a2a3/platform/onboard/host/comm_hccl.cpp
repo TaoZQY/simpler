@@ -46,7 +46,13 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+#if __has_include(<pto/comm/async/sdma/sdma_workspace_manager.hpp>)
+#include <pto/comm/async/sdma/sdma_workspace_manager.hpp>
+#elif __has_include(<pto/npu/comm/async/sdma/sdma_workspace_manager.hpp>)
+#include <pto/npu/comm/async/sdma/sdma_workspace_manager.hpp>
+#else
+#error "PTO SDMA workspace manager header not found"
+#endif
 #endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation

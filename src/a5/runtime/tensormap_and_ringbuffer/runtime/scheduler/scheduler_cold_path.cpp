@@ -1055,15 +1055,6 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 
 void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
     while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
-        if (thread_idx == 0 && sched_ != nullptr) {
-            // Use the wiring subsystem's normal batch/backoff policy while
-            // waiting. This still honors orch_needs_drain/producer_blocked
-            // signals without force-draining an empty queue every spin.
-            int wired = sched_->drain_wiring_queue(/*force_drain=*/false);
-            if (wired > 0) {
-                continue;
-            }
-        }
         if (sched_ != nullptr && sched_->sm_header != nullptr &&
             check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
             break;

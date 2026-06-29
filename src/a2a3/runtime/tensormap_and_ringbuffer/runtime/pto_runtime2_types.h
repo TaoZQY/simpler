@@ -432,7 +432,7 @@ struct alignas(64) PTO2TaskSlotState {
     // after, so all earlier subtasks' writes are visible to the last subtask.
     std::atomic<bool> any_subtask_deferred{false};
     uint8_t _async_pad{0};
-    int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
+    int32_t dep_pool_mark{0};  // Dep pool top after orchestrator-side wiring
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)

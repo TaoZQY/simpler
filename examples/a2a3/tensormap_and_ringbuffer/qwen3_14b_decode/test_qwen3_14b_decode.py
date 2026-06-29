@@ -325,8 +325,8 @@ class TestQwen314BDecode(SceneTestCase):
         {
             "name": "StressBatch16Seq3500",
             "platforms": ["a2a3"],
-            # block_dim=0 -> auto (stream max capacity), matching the lib default.
-            "config": {"aicpu_thread_num": 4, "block_dim": 0},
+            # 910B stream capacity for this stress environment is 20.
+            "config": {"aicpu_thread_num": 4, "block_dim": 20},
             "params": {"seed": 1234, "seq_len": 3500},
         },
     ]

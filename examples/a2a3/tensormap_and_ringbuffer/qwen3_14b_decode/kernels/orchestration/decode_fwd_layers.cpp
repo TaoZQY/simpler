@@ -30,6 +30,8 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    constexpr int32_t kFaFusedBlockDim = 20;  // 910B stream capacity for this stress case.
+
     // External tensors
     const Tensor &ext_hidden_states = orch_args.tensor(0).ref();
     const Tensor &ext_input_rms_weight = orch_args.tensor(1).ref();
@@ -135,7 +137,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 TensorCreateInfo gate_acc_all_inline170_ci(gate_acc_all_inline170_ci_shapes, 2, DataType::FLOAT32);
                 uint32_t up_acc_all_inline247_ci_shapes[2] = {16, 17408};
                 TensorCreateInfo up_acc_all_inline247_ci(up_acc_all_inline247_ci_shapes, 2, DataType::FLOAT32);
-                uint32_t gm_pipe_buffer_0_ci_shapes[1] = {static_cast<uint32_t>((8192) * (24))};
+                uint32_t gm_pipe_buffer_0_ci_shapes[1] = {static_cast<uint32_t>((8192) * (kFaFusedBlockDim))};
                 TensorCreateInfo gm_pipe_buffer_0_ci(
                     gm_pipe_buffer_0_ci_shapes, 1, DataType::FLOAT32, /*manual_dep=*/true
                 );
@@ -356,7 +358,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 params_t16.add_scalar(max_blocks_per_seq_inline165);
                 params_t16.add_scalar(layer_cache_base_inline137);
                 MixedKernels mixed_16 = {16, 17, 17};
-                params_t16.launch_spec.set_block_num(24);
+                params_t16.launch_spec.set_block_num(kFaFusedBlockDim);
                 rt_submit_task(mixed_16, params_t16);
 
                 // Spmd online_softmax_spmd: online_softmax

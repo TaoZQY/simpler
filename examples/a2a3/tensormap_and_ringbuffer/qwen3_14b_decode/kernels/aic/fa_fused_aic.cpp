@@ -59,7 +59,7 @@ static __aicore__ void fa_fused_aic(
     const int64_t v16 = 5;
     const int64_t v17 = 8;
     const int64_t v18 = 43;
-    const int64_t v19 = 24;
+    const int64_t v19 = (v15 > 0) ? static_cast<int64_t>(v15) : 1;
     const int64_t v20 = 16;
     const int64_t v21 = 688;
     const int64_t v22 = 128;
@@ -73,7 +73,8 @@ static __aicore__ void fa_fused_aic(
 
 #if defined(__DAV_CUBE__)
     size_t v29 = (size_t)v23;
-    auto v30 = TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>(v11, v28, v28);
+    auto qk_pipe = TPipe<0, Direction::DIR_C2V, 8192, 4, 4, false>(v11, v28, v28);
+    auto p_pipe = TPipe<2, Direction::DIR_V2C, 8192, 4, 4, false>(v11, v28, v28);
     int32_t v31 = v1[v24];
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
@@ -164,11 +165,11 @@ static __aicore__ void fa_fused_aic(
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
         TPUSH<
-            TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>,
+            decltype(qk_pipe),
             Tile<
                 TileType::Acc, float, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 1024, PadValue::Null,
                 CompactMode::Null>,
-            TileSplitAxis::TILE_UP_DOWN>(v30, v54);
+            TileSplitAxis::TILE_UP_DOWN>(qk_pipe, v54);
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
         wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
@@ -256,11 +257,11 @@ static __aicore__ void fa_fused_aic(
             set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
             TPUSH<
-                TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>,
+                decltype(qk_pipe),
                 Tile<
                     TileType::Acc, float, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 1024, PadValue::Null,
                     CompactMode::Null>,
-                TileSplitAxis::TILE_UP_DOWN>(v30, v72);
+                TileSplitAxis::TILE_UP_DOWN>(qk_pipe, v72);
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
             int64_t v74 = (int64_t)((uint64_t)v57 - (uint64_t)v23);
             Tile<
@@ -295,11 +296,11 @@ static __aicore__ void fa_fused_aic(
                     TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 512,
                     PadValue::Min, CompactMode::Null>(v20, v22);
             TPOP<
-                TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>,
+                decltype(p_pipe),
                 Tile<
                     TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 512,
                     PadValue::Min, CompactMode::Null>,
-                TileSplitAxis::TILE_UP_DOWN>(v30, v80);
+                TileSplitAxis::TILE_UP_DOWN>(p_pipe, v80);
             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
             Tile<
                 TileType::Left, bfloat16_t, 16, 128, BLayout::RowMajor, -1, -1, SLayout::RowMajor, 512, PadValue::Min,
@@ -312,7 +313,6 @@ static __aicore__ void fa_fused_aic(
             wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
             wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
             TMOV(v81, v80);
-            TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>, TileSplitAxis::TILE_UP_DOWN>(v30);
             Tile<
                 TileType::Right, bfloat16_t, 128, 128, BLayout::RowMajor, -1, -1, SLayout::ColMajor, 512,
                 PadValue::Null, CompactMode::Null>
@@ -390,11 +390,11 @@ static __aicore__ void fa_fused_aic(
                 TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 512, PadValue::Min,
                 CompactMode::Null>(v20, v22);
         TPOP<
-            TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>,
+            decltype(p_pipe),
             Tile<
                 TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, -1, -1, SLayout::RowMajor, 512, PadValue::Min,
                 CompactMode::Null>,
-            TileSplitAxis::TILE_UP_DOWN>(v30, v95);
+            TileSplitAxis::TILE_UP_DOWN>(p_pipe, v95);
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID5);
         Tile<
             TileType::Left, bfloat16_t, 16, 128, BLayout::RowMajor, -1, -1, SLayout::RowMajor, 512, PadValue::Min,
@@ -407,7 +407,6 @@ static __aicore__ void fa_fused_aic(
         wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID5);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
         TMOV(v96, v95);
-        TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>, TileSplitAxis::TILE_UP_DOWN>(v30);
         Tile<
             TileType::Right, bfloat16_t, 128, 128, BLayout::RowMajor, -1, -1, SLayout::ColMajor, 512, PadValue::Null,
             CompactMode::Null>
@@ -474,7 +473,7 @@ static __aicore__ void fa_fused_aiv(
     const float v19 = 0.0883883461f;
     const int64_t v20 = 8;
     const int64_t v21 = 43;
-    const int64_t v22 = 24;
+    const int64_t v22 = (v15 > 0) ? static_cast<int64_t>(v15) : 1;
     const int64_t v23 = 0;
     const int64_t v24 = 16;
     const int64_t v25 = 688;
@@ -533,7 +532,6 @@ static __aicore__ void fa_fused_aiv(
             pipe_barrier(PIPE_V);
             TMULS(v48, v47, v19);
             set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>, TileSplitAxis::TILE_UP_DOWN>(v36);
             v48.SetValidShape(v18, v45);
             Tile<
                 TileType::Vec, float, 8, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min,

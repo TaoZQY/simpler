@@ -14,7 +14,13 @@
 #include <stdint.h>
 
 #include <pto/comm/async_common/async_event_impl.hpp>
+#if __has_include(<pto/comm/async/sdma/sdma_async_intrin.hpp>)
 #include <pto/comm/async/sdma/sdma_async_intrin.hpp>
+#elif __has_include(<pto/npu/comm/async/sdma/sdma_async_intrin.hpp>)
+#include <pto/npu/comm/async/sdma/sdma_async_intrin.hpp>
+#else
+#error "PTO SDMA async intrinsic header not found"
+#endif
 
 #include "pto_async_kernel_api.h"
 #include "aicore_completion_mailbox_types.h"

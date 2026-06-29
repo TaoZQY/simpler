@@ -584,14 +584,14 @@ struct PTO2SchedulerState {
         int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-        // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
+        // --- Cache Line 1+: Orchestrator-side wiring dep_pool ---
         alignas(64) PTO2DepListPool dep_pool;
-        // One-shot latch for the wiring-queue deadlock report (thread 0 only):
+        // One-shot latch for the legacy wiring-queue deadlock report:
         // the drain breaks on dep_pool exhaustion every call while wedged, so
         // the tier-1 structural diagnostic is emitted once, not per call.
         bool dep_deadlock_reported = false;
 #if PTO2_PROFILING
-        // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
+        // Published only for scope_stats; readers must not inspect dep_pool's non-atomic counters directly.
         alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
         std::atomic<int32_t> dep_pool_snapshot_top;
 #endif
@@ -651,12 +651,13 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Wiring subsystem — groups all wiring-related state for cache-line isolation.
+    // Legacy wiring SPSC state — kept for compatibility tests/manual fallback.
+    // Normal submissions are wired inline by the orchestrator.
     //
     // Three cache-line regions by writer:
-    //   1. batch_*  / backoff — thread 0 exclusive (local batch buffer)
-    //   2. queue    — SPSC: orchestrator push, thread 0 pop
-    //   3. orch_needs_drain — orchestrator write, thread 0 read
+    //   1. batch_*  / backoff — legacy drainer exclusive (local batch buffer)
+    //   2. queue    — SPSC: producer push, legacy drainer pop
+    //   3. orch_needs_drain — producer write, legacy drainer read
     struct alignas(64) WiringState {
         static constexpr uint64_t BATCH_SIZE = 30;
         static constexpr int BACKOFF_LIMIT = 32;
@@ -698,10 +699,10 @@ struct PTO2SchedulerState {
     // =========================================================================
 
     /**
-     * Drain wiring queue: pop submitted tasks and wire their fanout edges.
-     * Called by scheduler thread 0 each loop iteration. Sets fanin_count,
-     * acquires fanout_lock per producer, allocates dep_pool entries, and
-     * pushes ready tasks to the appropriate ready queue.
+     * Legacy wiring queue drain: pop submitted tasks and wire their fanout
+     * edges. Normal runtime submissions now call wire_task_from_orch()
+     * directly; this path remains for compatibility tests and fallback users of
+     * the SPSC queue.
      *
      * @return Number of tasks wired this call.
      */
@@ -793,6 +794,31 @@ struct PTO2SchedulerState {
         }
 
         return wired;
+    }
+
+    /**
+     * Wire one task directly from the orchestrator thread.
+     *
+     * The layout is still 1O+3S: O computes fanin and now also performs the
+     * fanout-head wiring / readiness enqueue that S0 used to drain from the
+     * SPSC queue. Scheduler threads only dispatch and complete ready work.
+     */
+    bool wire_task_from_orch(PTO2TaskSlotState *ws) {
+        int ring_id = ws->ring_id;
+        auto &rss = ring_sched_states[ring_id];
+        int32_t wfanin = ws->payload->fanin_actual_count;
+
+        if (wfanin > 0 && !rss.dep_pool.ensure_space(*rss.ring, wfanin)) {
+#if PTO2_PROFILING
+            if (is_scope_stats_enabled()) {
+                rss.publish_dep_pool_snapshot();
+            }
+#endif
+            return false;
+        }
+
+        wire_task(rss, ws, wfanin);
+        return true;
     }
 
     // Tier-1 structural diagnostic for a provable wiring-queue deadlock (head

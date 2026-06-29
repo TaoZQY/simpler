@@ -35,22 +35,31 @@ single FP32→bf16 round at the chunk tail.
 The 36 sources under `kernels/` (orchestration + 35 incores: 8 AIC + 27 AIV) and
 the golden `simpler_setup/goldens/qwen3_14b_decode.py` are **harvested pypto
 codegen** for `decode_fwd_layers` (`_CHUNK_NLAYERS=2`, `PTO2_MANUAL_MAX_SEQ=5500`):
-the orchestration + kernel `.cpp` (license header prepended, otherwise verbatim)
-and the `CALLABLE` transcribed from that run's `kernel_config.py`. The golden
+the orchestration + kernel `.cpp` (license header prepended, with the compatibility
+edits below) and the `CALLABLE` transcribed from that run's `kernel_config.py`. The golden
 ports the per-layer `golden_decode_layer` math (RoPE θ=1e4, controlled scales,
 FP32 residual, bf16 cast points) composed over the two layers with FP32 carry +
 per-layer KV pools.
 
-The kernels are used essentially as generated, with **one hand-edit** to
-`fa_fused_aiv`: the codegen emitted the AIV sub-block id as a `[[block_local]]
-static` (`pypto_runtime_subblock_id`) whose **non-branch** `.text` relocation
-simpler's strict `.text`-only loader rejects. The fix swaps it for the pto-isa
-explicit-offset pattern (`setEntryOffset(get_sub_block_id(args) * …)`) — no
-per-core static, no relocation. See Status below.
+The harvested kernels carry a few local compatibility edits:
+
+- `fa_fused_aiv` uses the pto-isa explicit-offset pattern
+  (`setEntryOffset(get_sub_block_id(args) * …)`) instead of the generated
+  `[[block_local]] static` sub-block-id cache, avoiding `.rela.text` relocations.
+- `fa_fused` strides work by the runtime block count instead of a hard-coded 24,
+  and orchestration launches it at `block_dim=20` for the current 910B stream
+  capacity.
+- The fused-attention CUBE/VEC tile pipe is split into explicit C2V and V2C
+  pipes. On A2A3 CANN 8.5.0, `Direction::DIR_BOTH` takes the C2V branch in
+  several compile-time paths.
+- Explicit `TFREE` calls after `TPOP` are removed in `fa_fused`; A2A3 CANN 8.5.0
+  already frees inside `TPOP_IMPL`, so a second free can over-credit the FIFO and
+  deadlock the mixed kernel.
 
 To regenerate: in pypto-lib, set `_CHUNK_NLAYERS=2`, `PTO2_MANUAL_MAX_SEQ=5500`,
 build the ×2-stacked inputs, and `decode_fwd_layers.compile_for_test(...)`; then
-harvest `orchestration/` + `kernels/` + `kernel_config.py`. No post-edit needed.
+harvest `orchestration/` + `kernels/` + `kernel_config.py`, then reapply the
+compatibility edits above.
 
 ## Running
 
@@ -76,7 +85,21 @@ pytest .../qwen3_14b_decode --platform a2a3 --device ${DEVICE} \
 The case passes deterministically on device — output and both layers' KV-cache
 match the torch reference (finite `max_abs_diff ≈ 0.03`).
 
-### Sub-block-id handling (the one hand-edit)
+### Local Compatibility Edits
+
+The pytest case runs with `block_dim=20` because this 910B environment only has
+20 usable stream slots for the stress launch. The FA loop stride uses the runtime
+block count (`v15`) so the same source can follow the launch shape instead of
+assuming 24 blocks.
+
+For A2A3 CANN 8.5.0, qwen's generated bidirectional FA tile pipe is represented
+as two single-direction pipes: qk scores use C2V (`FlagID=0`), and probabilities
+use V2C (`FlagID=2`). This avoids `Direction::DIR_BOTH` compile-time branch
+ambiguity while preserving the same GM slot layout. The generated explicit
+`TFREE` calls after `TPOP` are also omitted because `TPOP_IMPL` already releases
+the FIFO slot on this ISA.
+
+### Sub-block-id handling
 
 The fused-attention tile-pipe (`TPUSH/TPOP<…, TILE_UP_DOWN>`) computes its per-AIV
 FIFO offset from the **no-arg** ISA `get_subblockid()`, which under this MIX

@@ -11,7 +11,7 @@
 /**
  * Unit tests for scheduler wiring and completion paths:
  *
- * 1. wire_task()         — fanout wiring, early-finished detection,
+ * 1. wire_task() / wire_task_from_orch() — fanout wiring, early-finished detection,
  *                          fanin_count initialization, ready push
  * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
@@ -114,6 +114,26 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
 
     // Task should be in ready queue
+    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
+    auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
+    EXPECT_EQ(popped, &task_slot);
+}
+
+TEST_F(WiringTest, WireTaskFromOrchNoFaninBypassesLegacyQueue) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 0;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    EXPECT_EQ(sched.wiring.queue.size(), 0);
+    ASSERT_TRUE(sched.wire_task_from_orch(&task_slot));
+    EXPECT_EQ(sched.wiring.queue.size(), 0);
+
     PTO2ResourceShape shape = task_slot.active_mask.to_shape();
     auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_EQ(popped, &task_slot);

@@ -1026,23 +1026,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Phase 3: Drain wiring queue (thread 0 only)
+        // Phase 3: Normal wiring now runs inline on the orchestrator side.
+        // Keep the profiling variable for the disabled legacy SPSC path, but
+        // do not make S0 poll an empty wiring queue every scheduler iteration.
         int wired = 0;
-        if (thread_idx == 0) {
-            wired = sched_->drain_wiring_queue(orchestrator_done_.load(std::memory_order_relaxed));
-            if (wired > 0) {
-                made_progress = true;
-#if PTO2_SCHED_PROFILING
-                l2_swimlane.phase_wiring_count += wired;
-#endif
-            }
-        }
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
-        // Wire outer phase: emit one bar covering this iter's drain_wiring_queue
-        // pass when it wired any tasks. tasks_processed = wired count. Resolve
-        // does NOT nest under Wire — wiring only enqueues, the consumer release
-        // happens later in Complete/Dummy.
+        // Legacy Wire outer phase. Normal wiring is performed by the
+        // orchestrator, so scheduler iterations normally leave wired == 0.
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && wired > 0) {
             int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
             capture_local_snapshot(phase_end_local);

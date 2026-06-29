@@ -439,10 +439,9 @@ static bool prepare_task(
     // here lets RingSchedState::init_data_from_layout() skip the
     // O(window_size) bind loop. Both writes hit the same 64B slot_state
     // cache line we're about to dirty below, so the extra cost is two
-    // stores on an already-hot line. Must precede the scheduler
-    // wiring.queue.push at the end of submit_task_common — that push is
-    // the first read of slot_state->task / slot_state->payload by another
-    // thread.
+    // stores on an already-hot line. Must precede the scheduler direct wiring
+    // call at the end of submit_task_common — that call may enqueue the slot
+    // for dispatch by scheduler threads.
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
@@ -855,28 +854,14 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    if (!sched->wiring.queue.push(&cur_slot_state)) {
-        // producer_blocked is the wiring deadlock detector's "orchestrator is
-        // stuck in push" observable: set ONLY while we actually spin (queue
-        // full), cleared on exit, so the just-filled-then-scope_end case (push
-        // succeeded, no spin) never trips a false deadlock. Also poll the shared
-        // orch_error_code so a fatal latched by any party (e.g. that detector)
-        // breaks this otherwise-unbounded spin and unwinds orchestration.
-        sched->wiring.producer_blocked.store(1, std::memory_order_release);
-        while (!sched->wiring.queue.push(&cur_slot_state)) {
-            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                orch->fatal = true;
-                sched->wiring.producer_blocked.store(0, std::memory_order_release);
-                return result;
-            }
-            SPIN_WAIT_HINT();
-        }
-        sched->wiring.producer_blocked.store(0, std::memory_order_release);
+    // === STEP 6: wire on the orchestrator side ===
+    // The layout remains 1O+3S, but normal wiring no longer goes through S0's
+    // drain loop. O already computed fanin and claimed producer fanout_count;
+    // now it also links fanout_head entries, seeds fanin_refcount for early
+    // finished producers, and routes ready tasks to the shared ready queues.
+    if (!sched->wire_task_from_orch(&cur_slot_state)) {
+        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+        return result;
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
