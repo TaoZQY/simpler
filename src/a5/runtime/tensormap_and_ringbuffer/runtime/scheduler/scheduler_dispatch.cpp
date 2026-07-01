@@ -23,6 +23,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "device_time_fast.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -193,7 +194,7 @@ void SchedulerContext::dispatch_subtask_to_core(
     // immediately before the DATA_MAIN_BASE write.
 #if PTO2_PROFILING
     if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-        uint64_t dispatch_ts = get_sys_cnt_aicpu();
+        uint64_t dispatch_ts = fast_sys_cnt_aicpu();
         if (to_pending) {
             core_exec_state.pending_dispatch_timestamp = dispatch_ts;
         } else {
