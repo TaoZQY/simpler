@@ -422,6 +422,21 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
+# Exercise ChipWorker's dlopen/dlsym admission before the context factory.
+add_library(pipeline_contract_runtime SHARED stubs/pipeline_contract_runtime.cpp)
+target_include_directories(pipeline_contract_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+add_hierarchical_test(test_pipeline_contract_loader hierarchical/test_pipeline_contract_loader.cpp)
+add_dependencies(test_pipeline_contract_loader pipeline_contract_runtime)
+target_compile_definitions(test_pipeline_contract_loader PRIVATE
+    PIPELINE_FIXTURE_PATH="$<TARGET_FILE:pipeline_contract_runtime>"
+)
+
+
 # Run-stream pair state machine: publication-aware AICore stream reuse,
 # submitter-gated retirement, and failed-destroy ownership. Header-only with
 # injected create/destroy, so it needs no runtime objects and no device.
@@ -953,6 +968,32 @@ set(HBG_ORCH_SHARED_SOURCES
     ${CMAKE_SOURCE_DIR}/stubs/hbg_orch_stubs.cpp
     ${HBG_SHARED_RUNTIME_SOURCES}
 )
+add_a2a3_hbg_runtime_test(test_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
+foreach(arch IN ITEMS a2a3 a5)
+    if(arch STREQUAL "a2a3")
+        set(hbg_build_target test_hbg_host_graph_build)
+    else()
+        set(hbg_build_target test_a5_hbg_host_graph_build)
+    endif()
+    target_compile_definitions(${hbg_build_target} PRIVATE SIMPLER_PLATFORM_NAME="${arch}sim")
+    target_sources(${hbg_build_target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/host_build_graph/host/runtime_maker.cpp
+        ${HBG_SHARED_RUNTIME_SOURCES}
+        ${HBG_HOST_DIR}/orchestrator.cpp
+        ${HBG_HOST_DIR}/runtime_core.cpp
+        ${HBG_HOST_DIR}/host_tensor_access.cpp
+        ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+        ${HBG_HOST_DIR}/ready_queue_sizing.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+    )
+    target_sources(${hbg_build_target} PRIVATE ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp)
+    target_link_libraries(${hbg_build_target} PRIVATE ${CMAKE_DL_LIBS})
+endforeach()
+
 add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_hbg_task_allocator.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_dep_gen_host_graph a2a3/test_dep_gen_host_graph.cpp)
