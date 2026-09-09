@@ -98,3 +98,6 @@ size_t graph_host_arena_used(const GraphHostState &state);
 bool graph_host_rebind_staging(GraphHostState &state, void *base, size_t capacity);
 std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t index);
 GraphHostDefinitionList graph_host_definitions(GraphHostState &state);
+
+// Borrowed Definition image, valid under the same workspace lease as the build.
+const std::byte *graph_host_definition_data(const GraphHostState &state, uint64_t full_key);
