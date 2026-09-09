@@ -59,6 +59,7 @@
 #include <stdint.h>
 
 #include "device_memory_info.h"
+#include "../task_interface/execution_mode.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
@@ -140,7 +141,8 @@ typedef enum PipelineResourceClass {
     /* Not rewritten per run: whoever populates it does so once, and device ops
        run one at a time, so a single instance is reused across runs. */
     PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped. */
+    /* Execution role. Kernel mode owns a dedicated non-hidden AICPU stream
+       and a hidden AICore stream; both are distinct from borrowed caller. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
 } PipelineResourceClass;
 
@@ -160,7 +162,10 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Size of one copy. Reserved: currently declared as 0 and required to be 0. */
+    /* Program: reserved, must be 0. Kernel: arena kinds declare nonzero
+       required usable bytes per copy, not committed HBM or capacity budgets.
+       Streams and TASK_ARGS must be 0; task-argument byte limits are not
+       represented by this field. */
     uint64_t bytes_per_copy;
 } PipelineResource;
 
@@ -573,13 +578,6 @@ typedef enum SimplerKernelCtxAction {
        rejected. */
     SIMPLER_KERNEL_CTX_FREEZE = 2,
 } SimplerKernelCtxAction;
-
-typedef enum SimplerExecutionMode {
-    /* Historical exclusive-device semantics; the default when
-       simpler_kernel_mode_ctx_control is never called. */
-    SIMPLER_MODE_PROGRAM = 0,
-    SIMPLER_MODE_KERNEL = 1,
-} SimplerExecutionMode;
 
 /**
  * Versioned wire payload of simpler_kernel_mode_ctx_control. Validation is

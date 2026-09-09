@@ -11,6 +11,7 @@
 #pragma once
 
 #include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/kernel_resource_requirements.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/ready_queue_sizing.h"
 #include "host_build_graph/shared_memory.h"
@@ -56,6 +57,14 @@ int32_t build_graph(
     Runtime *runtime, HostTensorAccessor &tensor_access, RuntimeContext *rt, void *host_sm, uint64_t sm_size,
     uint64_t task_capacity, const GraphDefinitionArena &definition_arena, const HostOrchEntryPoints &entry_points,
     const ChipTaskArgs &args, GraphBuild &build
+);
+
+// Capture-external query. Does not allocate device resources, bind addresses or
+// upload. The output owns no buffers and is unchanged on failure. The layout must
+// describe the intended destination (program layout or compact kernel layout)
+// for the same runtime ABI and task window.
+int32_t get_graph_resource_requirements(
+    const GraphBuild &build, const RuntimeArenaLayout &layout, GraphResourceRequirements &requirements
 );
 
 // Program-only allocation and synchronous H2D boundary; not a kernel capture path.
