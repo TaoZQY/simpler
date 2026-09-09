@@ -241,6 +241,17 @@ int KernelExecutionState::freeze_resources() {
     return resources_.freeze();
 }
 
+int KernelExecutionState::inspect_frozen_resources(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if ((phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) ||
+        device_id != device_id_ || generation != context_generation_)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.bind(schema, required, count, out);
+}
+
 int KernelExecutionState::bind_resources_for_launch(
     int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
     KernelResourceBinding &out

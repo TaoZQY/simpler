@@ -59,7 +59,7 @@ public:
 
 private:
     friend int make_graph_launch_template(
-        const GraphBuild &, const RuntimeContext &, const KernelExecutionState &, int, uint64_t,
+        const GraphBuild &, const RuntimeContext &, const KernelExecutionState &, int, uint64_t, uint64_t,
         const GraphInvocationIdentity &, GraphLaunchTemplate &
     );
     std::vector<uint64_t> storage_;
@@ -71,7 +71,8 @@ private:
 // All destination accesses here are address arithmetic, never device memory IO.
 int make_graph_launch_template(
     const GraphBuild &build, const RuntimeContext &runtime, const KernelExecutionState &context, int device_id,
-    uint64_t slot_generation, const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
+    uint64_t slot_generation, uint64_t runtime_binary_id, const GraphInvocationIdentity &identity,
+    GraphLaunchTemplate &out
 );
 
 struct GraphHostArgs {

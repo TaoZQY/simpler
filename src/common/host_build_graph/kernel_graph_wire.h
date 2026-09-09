@@ -22,7 +22,7 @@
 namespace hbg {
 
 inline constexpr uint32_t GRAPH_PACKET_MAGIC = 0x50474248;  // HBGP
-inline constexpr uint16_t GRAPH_PACKET_VERSION = 1;
+inline constexpr uint16_t GRAPH_PACKET_VERSION = 2;
 
 enum class GraphImageKind : uint32_t { Runtime = 1, Definitions = 2, Scheduler = 3 };
 enum class GraphPacketAddress : uint32_t { HostTemplate, DeviceCopy };
@@ -70,7 +70,9 @@ struct GraphPacketHeader {
     uint32_t total_tasks;
     uint32_t region_count;
     GraphDestination destinations[4];  // heap, runtime/SM, Definitions, A5 scheduler
-    uint64_t reserved[2];
+    int32_t device_id;
+    uint32_t reserved;
+    uint64_t runtime_binary_id;  // Runtime ABI/code identity, independent of callable identity.
 };
 
 static_assert(std::is_trivially_copyable_v<GraphDestination> && std::is_standard_layout_v<GraphDestination>);
@@ -84,6 +86,8 @@ static_assert(offsetof(GraphPacketHeader, inline_payload_addr) == 32);
 static_assert(offsetof(GraphPacketHeader, checksum) == 40);
 static_assert(offsetof(GraphPacketHeader, slot_generation) == 48);
 static_assert(offsetof(GraphPacketHeader, destinations) == 112);
+static_assert(offsetof(GraphPacketHeader, device_id) == 176);
+static_assert(offsetof(GraphPacketHeader, runtime_binary_id) == 184);
 static_assert(offsetof(GraphImageRegion, source_offset) == 8);
 
 inline bool graph_span_fits(uint64_t offset, uint64_t size, uint64_t capacity) noexcept {
@@ -124,8 +128,8 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         header.header_bytes != sizeof(header) || header.total_bytes != size - prefix || header.region_count < 1 ||
         header.region_count > 3 || header.slot_generation == 0 || header.callable_hash == 0 ||
         header.argument_hash == 0 || header.function_hash == 0 || header.task_window == 0 ||
-        header.task_window > 32768 || header.total_tasks >= header.task_window || header.reserved[0] != 0 ||
-        header.reserved[1] != 0)
+        header.task_window > 32768 || header.total_tasks >= header.task_window || header.reserved != 0 ||
+        header.device_id < 0 || header.runtime_binary_id == 0)
         return GraphPacketStatus::InvalidHeader;
     const uint64_t table_end = sizeof(header) + header.region_count * sizeof(GraphImageRegion);
     const uint64_t payload_offset = (table_end + 63) & ~uint64_t{63};
