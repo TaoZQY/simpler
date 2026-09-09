@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <future>
 #include <vector>
 
 #include "host_build_graph/host_graph_build.h"
@@ -21,6 +22,8 @@
 #include "host_build_graph/runtime.h"
 #include "common/host_api.h"
 #include "worker/runtime_c_api.h"
+#include "host/kernel_pipeline_contract.h"
+#include "call_config.h"
 
 namespace {
 
@@ -125,6 +128,17 @@ void graph_entry(const ChipTaskArgs &) {
     ASSERT_TRUE(orch.graph_end());
 }
 
+void repeated_graph_entry(const ChipTaskArgs &args) {
+    graph_entry(args);
+    const uint32_t shape[] = {16};
+    auto boundary = simpler::hbg::make_tensor_external(reinterpret_cast<uint32_t *>(0x2000), shape, 1);
+    GraphTaskArgs graph_args;
+    graph_args.add_input(boundary);
+    const auto scope = bound_runtime->orchestrator->graph_begin(0x81, graph_args, bound_runtime->active_callable_hash);
+    EXPECT_FALSE(scope.execute_block);
+    EXPECT_TRUE(scope.task_id.is_valid());
+}
+
 void two_definitions_entry(const ChipTaskArgs &args) {
     graph_entry(args);
     const uint32_t shape[] = {16};
@@ -188,8 +202,9 @@ protected:
 
     void build_mixed_definitions() {
         ASSERT_GE(build(graph_entry), 0);
-        ASSERT_GE(upload(), 0);
-        platform.copies.clear();
+        hbg::GraphResourceRequirements single;
+        ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, single), 0);
+        platform.staging.reserve(single.graph_definition_bytes, GRAPH_DEFINITION_OBJECT_ALIGN);
         definition_arena.base = platform.staging.data();
         definition_arena.capacity = platform.staging.size();
         ASSERT_GE(build(two_definitions_entry), 0);
@@ -313,13 +328,311 @@ TEST_F(HostGraphBuildTest, RepeatedUploadAfterDefinitionStagingGrowth) {
     EXPECT_EQ(platform.copies[copies_per_upload], first_definitions);
 }
 
-TEST_F(HostGraphBuildTest, FailedDefinitionCopyAfterGrowthCanBeRetried) {
+TEST_F(HostGraphBuildTest, FailedDefinitionCopyAfterGrowthCanBeQueriedAndRetried) {
     build_mixed_definitions();
+    hbg::GraphResourceRequirements before;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, before), 0);
     platform.fail_copy = 1;
     ASSERT_EQ(upload(), PTO_RUNTIME_ERR_INTERNAL);
+    hbg::GraphResourceRequirements after;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, after), 0);
+    EXPECT_EQ(after.graph_definition_bytes, before.graph_definition_bytes);
     platform.fail_copy = 0;
     ASSERT_GE(upload(), 0);
     ASSERT_GE(upload(), 0);
+}
+
+TEST_F(HostGraphBuildTest, KernelRequirementsMatchDeviceRegionsWithoutUploading) {
+    ASSERT_EQ(build(chain_entry), 2);
+    hbg::GraphResourceRequirements requirements;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), 0);
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&requirements, 1, plan), 0);
+    const auto contract = plan.pipeline_contract();
+    ASSERT_TRUE(is_valid_hbg_kernel_pipeline_contract(&contract));
+    EXPECT_EQ(contract.pipeline_depth, 1u);
+    EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_GM_SM), nullptr);
+    EXPECT_EQ(requirements.runtime_arena_bytes, layout.off_copied_end + result.image_bytes);
+    EXPECT_EQ(requirements.graph_definition_bytes, 0u);
+    EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE)->bytes_per_copy, plan.runtime_arena_bytes());
+    if (requirements.scheduler_state_bytes != 0) {
+        EXPECT_GE(plan.scheduler_offset(), requirements.runtime_arena_bytes);
+        EXPECT_LE(plan.scheduler_offset() + requirements.scheduler_state_bytes, plan.runtime_arena_bytes());
+    }
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_TRUE(platform.allocations.empty());
+    EXPECT_EQ(platform.commits, 0);
+    EXPECT_EQ(platform.definition_acquires, 0);
+    ASSERT_EQ(upload(), 2);
+    EXPECT_EQ(platform.heap_bytes, requirements.gm_heap_bytes);
+    EXPECT_EQ(platform.runtime_image.size(), requirements.runtime_arena_bytes);
+    uint64_t scheduler_allocated = 0;
+    for (const auto &allocation : platform.allocations)
+        scheduler_allocated += allocation->size();
+    EXPECT_LE(scheduler_allocated, requirements.scheduler_state_bytes);
+    uint64_t total = 0;
+    ASSERT_TRUE(requirements.required_bytes(total));
+    EXPECT_EQ(
+        total, requirements.gm_heap_bytes + requirements.runtime_arena_bytes + requirements.scheduler_state_bytes
+    );
+}
+
+TEST_F(HostGraphBuildTest, KernelRequirementsCountDefinitionFramingAndRetainedStaging) {
+    for (bool retained : {false, true}) {
+        if (retained) {
+            platform.staging.reserve(256 * 1024, GRAPH_DEFINITION_OBJECT_ALIGN);
+            definition_arena.base = platform.staging.data();
+            definition_arena.capacity = platform.staging.size();
+        }
+        ASSERT_GE(build(graph_entry), 0);
+        hbg::GraphResourceRequirements requirements;
+        ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), 0);
+        EXPECT_GT(requirements.graph_definition_bytes, 0u);
+        EXPECT_EQ(requirements.graph_definition_bytes % GRAPH_DEFINITION_OBJECT_ALIGN, 0u);
+        EXPECT_EQ(requirements.scheduler_state_bytes, 0u);
+        hbg::KernelResourcePlan plan;
+        ASSERT_EQ(hbg::KernelResourcePlan::create(&requirements, 1, plan), 0);
+        const auto contract = plan.pipeline_contract();
+        ASSERT_TRUE(is_valid_hbg_kernel_pipeline_contract(&contract));
+        EXPECT_GE(plan.definition_offset(), requirements.runtime_arena_bytes);
+        EXPECT_LE(plan.definition_offset() + requirements.graph_definition_bytes, plan.runtime_arena_bytes());
+        EXPECT_EQ(
+            find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE)->bytes_per_copy, plan.runtime_arena_bytes()
+        );
+        ASSERT_GE(upload(), 0);
+        EXPECT_EQ(platform.definitions.size(), requirements.graph_definition_bytes);
+        EXPECT_EQ(platform.heap_bytes, requirements.gm_heap_bytes);
+        EXPECT_EQ(platform.runtime_image.size(), requirements.runtime_arena_bytes);
+    }
+}
+
+TEST_F(HostGraphBuildTest, KernelRequirementSnapshotSurvivesAnotherBuild) {
+    ASSERT_EQ(build(empty_entry), 0);
+    hbg::GraphResourceRequirements first;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, first), 0);
+    const uint64_t first_image_bytes = first.runtime_arena_bytes;
+    ASSERT_EQ(build(chain_entry), 2);
+    hbg::GraphResourceRequirements second;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, second), 0);
+    EXPECT_GT(second.runtime_arena_bytes, first.runtime_arena_bytes);
+    EXPECT_EQ(first.runtime_arena_bytes, first_image_bytes);
+    EXPECT_TRUE(platform.copies.empty());
+}
+
+TEST_F(HostGraphBuildTest, KernelRequirementsRejectFailedBuildAndSizeOverflow) {
+    hbg::GraphResourceRequirements requirements{1, 2, 3, 4};
+    EXPECT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(requirements.gm_heap_bytes, 1u);
+    EXPECT_LT(build(fatal_entry), 0);
+    EXPECT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(build(chain_entry), 2);
+    result.image_bytes = UINT64_MAX;
+    EXPECT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
+    EXPECT_EQ(requirements.runtime_arena_bytes, 2u);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(platform.commits, 0);
+}
+
+TEST(HbgKernelRequirements, IncludesSeparateBlocksAndRejectsTotalOverflow) {
+    hbg::GraphResourceRequirements requirements{4096, 8192, 256, 512};
+    uint64_t total = 0;
+    ASSERT_TRUE(requirements.required_bytes(total));
+    EXPECT_EQ(total, 13056u);
+    requirements.graph_definition_bytes = UINT64_MAX;
+    EXPECT_FALSE(requirements.required_bytes(total));
+    EXPECT_EQ(total, 13056u);
+    requirements.graph_definition_bytes = 0;
+    requirements.scheduler_state_bytes = UINT64_MAX;
+    EXPECT_FALSE(requirements.required_bytes(total));
+    EXPECT_EQ(total, 13056u);
+}
+
+TEST(HbgKernelRequirements, RejectsMalformedDefinitionPacking) {
+    uint64_t bytes = 17;
+    GraphHostDefinitionList defs;
+    EXPECT_FALSE(hbg::graph_definition_block_bytes(defs, 1, bytes));
+    defs.entries.push_back({1, GRAPH_NO_OBJECT_OFFSET, reinterpret_cast<const std::byte *>(1), UINT64_MAX});
+    EXPECT_FALSE(hbg::graph_definition_block_bytes(defs, 0, bytes));
+    defs.entries[0].bytes = sizeof(GraphDefinition);
+    EXPECT_FALSE(hbg::graph_definition_block_bytes(defs, UINT64_MAX - GRAPH_DEFINITION_OBJECT_ALIGN + 1, bytes));
+    defs.entries[0] = {1, 0, nullptr, sizeof(GraphDefinition)};
+    EXPECT_FALSE(hbg::graph_definition_block_bytes(defs, 0, bytes));
+    EXPECT_EQ(bytes, 17u);
+}
+
+TEST(HbgKernelResourcePlan, RebuildsDisjointRegionsFromCompatibleGraphMaxima) {
+    const hbg::GraphResourceRequirements graphs[] = {{4096, 8192, 512, 0}, {8192, 4096, 0, 2048}};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(graphs, 2, plan), 0);
+    EXPECT_EQ(plan.capacity().gm_heap_bytes, 8192u);
+    EXPECT_EQ(plan.capacity().runtime_arena_bytes, 8192u);
+    EXPECT_EQ(plan.definition_offset(), 8192u);
+    EXPECT_EQ(plan.scheduler_offset(), 9216u);
+    EXPECT_EQ(plan.runtime_arena_bytes(), 11264u);
+    EXPECT_TRUE(plan.admits(graphs[0]));
+    EXPECT_TRUE(plan.admits(graphs[1]));
+    const auto contract = plan.pipeline_contract();
+    ASSERT_TRUE(is_valid_hbg_kernel_pipeline_contract(&contract));
+    EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_GM_HEAP)->bytes_per_copy, 8192u);
+    EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE)->bytes_per_copy, 11264u);
+}
+
+TEST(HbgKernelResourcePlan, RejectsEachRegionOverCapacityWithoutChangingThePlan) {
+    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    hbg::KernelResourcePlan plan;
+    EXPECT_FALSE(plan.admits(graph));
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    EXPECT_TRUE(plan.admits(graph));
+    const uint64_t arena_bytes = plan.runtime_arena_bytes();
+    for (auto field :
+         {&hbg::GraphResourceRequirements::gm_heap_bytes, &hbg::GraphResourceRequirements::runtime_arena_bytes,
+          &hbg::GraphResourceRequirements::graph_definition_bytes,
+          &hbg::GraphResourceRequirements::scheduler_state_bytes}) {
+        auto candidate = graph;
+        ++(candidate.*field);
+        EXPECT_FALSE(plan.admits(candidate));
+        EXPECT_TRUE(plan.admits(graph));
+        EXPECT_EQ(plan.runtime_arena_bytes(), arena_bytes);
+    }
+    EXPECT_FALSE(plan.admits({}));
+}
+
+TEST(HbgKernelResourcePlan, RejectsAggregateAndAlignmentOverflowWithoutPublishing) {
+    const hbg::GraphResourceRequirements good{4096, 8192, 512, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&good, 1, plan), 0);
+    const auto original = plan.pipeline_contract();
+    const hbg::GraphResourceRequirements aggregate[] = {{UINT64_MAX / 2, 1, 0, 0}, {1, UINT64_MAX / 2 + 2, 0, 0}};
+    const hbg::GraphResourceRequirements alignment{1, UINT64_MAX - 512, 16, 0};
+    for (const auto &graph : aggregate) {
+        uint64_t total;
+        ASSERT_TRUE(graph.required_bytes(total));
+    }
+    EXPECT_EQ(hbg::KernelResourcePlan::create(aggregate, 2, plan), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
+    EXPECT_EQ(hbg::KernelResourcePlan::create(&alignment, 1, plan), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
+    EXPECT_EQ(hbg::KernelResourcePlan::create(nullptr, 1, plan), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(hbg::KernelResourcePlan::create(&good, 0, plan), PTO_RUNTIME_ERR_INTERNAL);
+    const auto after = plan.pipeline_contract();
+    EXPECT_EQ(std::memcmp(&after, &original, sizeof(after)), 0);
+    EXPECT_EQ(plan.definition_offset(), 8192u);
+    EXPECT_TRUE(plan.admits(good));
+}
+
+TEST(HbgKernelStreamBinding, BindsThreeDistinctStreamsForBothRuntimeContracts) {
+    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    auto contract = plan.pipeline_contract();
+    int caller = 0, aicpu = 0, hidden = 0;
+    KernelStreamBinding binding;
+    ASSERT_EQ(bind_kernel_stream_roles(&contract, &caller, &aicpu, &hidden, binding), 0);
+    EXPECT_EQ(binding.caller_stream, &caller);
+    EXPECT_EQ(binding.aicpu_stream, &aicpu);
+    EXPECT_EQ(binding.aicore_stream, &hidden);
+    contract.resources[0].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
+    contract.resources[1].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
+    contract.resources[contract.resource_count++] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 1024};
+    contract.resources[contract.resource_count++] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0};
+    ASSERT_TRUE(is_valid_tmr_kernel_pipeline_contract(&contract));
+    ASSERT_EQ(bind_kernel_stream_roles(&contract, &caller, &aicpu, &hidden, binding), 0);
+    EXPECT_EQ(binding.caller_stream, &caller);
+    EXPECT_EQ(binding.aicpu_stream, &aicpu);
+    EXPECT_EQ(binding.aicore_stream, &hidden);
+}
+
+TEST(HbgKernelStreamBinding, RejectsMissingRolesAndEveryStreamAliasBeforePublishing) {
+    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    auto contract = plan.pipeline_contract();
+    int caller = 0, aicpu = 0, hidden = 0;
+    KernelStreamBinding binding{&caller, &aicpu, &hidden};
+    for (uint32_t missing : {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_AICORE_STREAM}) {
+        auto candidate = contract;
+        for (uint32_t i = 0; i < candidate.resource_count; ++i) {
+            if (candidate.resources[i].kind == missing) {
+                candidate.resources[i] = candidate.resources[--candidate.resource_count];
+                break;
+            }
+        }
+        EXPECT_EQ(bind_kernel_stream_roles(&candidate, &caller, &aicpu, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    }
+    EXPECT_EQ(bind_kernel_stream_roles(nullptr, &caller, &aicpu, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, nullptr, &aicpu, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, &caller, nullptr, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, &caller, &aicpu, nullptr, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, &caller, &caller, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, &caller, &aicpu, &caller, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(bind_kernel_stream_roles(&contract, &caller, &hidden, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(
+        bind_kernel_stream_roles(get_pipeline_contract(), &caller, &aicpu, &hidden, binding), PTO_RUNTIME_ERR_INTERNAL
+    );
+    EXPECT_EQ(binding.caller_stream, &caller);
+    EXPECT_EQ(binding.aicpu_stream, &aicpu);
+    EXPECT_EQ(binding.aicore_stream, &hidden);
+}
+
+TEST_F(HostGraphBuildTest, KernelRequirementsCountSharedDefinitionsOnce) {
+    ASSERT_GE(build(repeated_graph_entry), 0);
+    ASSERT_EQ(graph_host_upload_count(*result.graph_state), 2u);
+    const auto definitions = graph_host_definitions(*result.graph_state);
+    ASSERT_EQ(definitions.entries.size(), 1u);
+    hbg::GraphResourceRequirements requirements;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), 0);
+    const auto object_bytes = sizeof(GraphDefinitionHeader) + definitions.entries[0].bytes;
+    const auto aligned = (object_bytes + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
+    EXPECT_EQ(requirements.graph_definition_bytes, aligned);
+    ASSERT_GE(upload(), 0);
+    EXPECT_EQ(platform.definitions.size(), requirements.graph_definition_bytes);
+}
+
+TEST_F(HostGraphBuildTest, KernelQueryPreservesProgramDeclaration) {
+    const PipelineContract before = *get_pipeline_contract();
+    ASSERT_TRUE(is_valid_pipeline_contract(&before));
+    ASSERT_EQ(build(empty_entry), 0);
+    hbg::GraphResourceRequirements requirements;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, requirements), 0);
+    const auto *after = get_pipeline_contract();
+    EXPECT_EQ(after->pipeline_depth, before.pipeline_depth);
+    EXPECT_EQ(after->resource_count, before.resource_count);
+    for (uint32_t i = 0; i < after->resource_count; ++i) {
+        EXPECT_EQ(after->resources[i].kind, before.resources[i].kind);
+        EXPECT_EQ(after->resources[i].resource_class, before.resources[i].resource_class);
+        EXPECT_EQ(after->resources[i].bytes_per_copy, 0u);
+    }
+}
+
+TEST(HbgKernelRequirements, ConfigOnlyHookCannotPublishGraphDependentSizes) {
+    const PipelineContract original = *get_pipeline_contract();
+    PipelineContract output = original;
+    CallConfig config;
+    EXPECT_EQ(build_kernel_pipeline_contract_impl(&config, &output), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(std::memcmp(&output, &original, sizeof(output)), 0);
+    EXPECT_EQ(build_kernel_pipeline_contract_impl(nullptr, &output), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(std::memcmp(&output, &original, sizeof(output)), 0);
+}
+
+TEST_F(HostGraphBuildTest, ConcurrentKernelQueriesPublishIndependentSnapshots) {
+    ASSERT_GE(build(graph_entry), 0);
+    hbg::GraphResourceRequirements expected;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, expected), 0);
+    auto query = [&]() {
+        hbg::GraphResourceRequirements output;
+        const auto status = hbg::get_graph_resource_requirements(result, layout, output);
+        return std::make_pair(status, output);
+    };
+    auto first = std::async(std::launch::async, query);
+    auto second = std::async(std::launch::async, query);
+    for (auto *future : {&first, &second}) {
+        const auto [status, output] = future->get();
+        EXPECT_EQ(status, 0);
+        EXPECT_EQ(output.gm_heap_bytes, expected.gm_heap_bytes);
+        EXPECT_EQ(output.runtime_arena_bytes, expected.runtime_arena_bytes);
+        EXPECT_EQ(output.graph_definition_bytes, expected.graph_definition_bytes);
+        EXPECT_EQ(output.scheduler_state_bytes, expected.scheduler_state_bytes);
+    }
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(platform.commits, 0);
 }
 
 }  // namespace

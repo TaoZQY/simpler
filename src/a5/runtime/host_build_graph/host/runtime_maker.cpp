@@ -84,6 +84,7 @@
 #include "host_log.h"
 #include "host/platform_compile_info.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -104,6 +105,11 @@ static_assert(
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    // CallConfig alone cannot determine the graph-dependent heap and image sizes.
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -1424,6 +1430,41 @@ int32_t hbg::build_graph(
     build.heap_bytes = heap_bytes;
     build.ready = true;
     return total_tasks;
+}
+
+int32_t hbg::get_graph_resource_requirements(
+    const GraphBuild &build, const RuntimeArenaLayout &layout, GraphResourceRequirements &requirements
+) {
+    if (!build.ready || !build.graph_state || build.total_tasks < 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (layout.off_copied_begin > layout.off_copied_end || build.heap_bytes == 0 || build.image_bytes == 0) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    GraphResourceRequirements next{};
+    next.gm_heap_bytes = build.heap_bytes;
+    next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
+    if (!graph_definition_block_bytes(
+            graph_host_definitions(*build.graph_state), graph_host_arena_used(*build.graph_state),
+            next.graph_definition_bytes
+        )) {
+        return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    }
+    if (graph_host_upload_count(*build.graph_state) == 0) {
+        static_assert(SCHEDULER_STATE_ALIGNMENT <= DeviceArena::kDefaultBaseAlign);
+        // The resident layout sizes arrays by total task count. Supplying the
+        // maximum per-core-type counts also bounds any non-Graph fallback.
+        AicoreSchedulerLayout scheduler_layout{};
+        const uint64_t tasks = static_cast<uint64_t>(build.total_tasks);
+        if (!scheduler_plan_layout(tasks, tasks, tasks, &scheduler_layout) ||
+            scheduler_layout.total_size > UINT64_MAX - (SCHEDULER_STATE_ALIGNMENT - 1)) {
+            return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+        }
+        next.scheduler_state_bytes = scheduler_layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
+    }
+    uint64_t total = 0;
+    if (!next.required_bytes(total)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    requirements = next;
+    return 0;
 }
 
 int32_t hbg::upload_program_graph(

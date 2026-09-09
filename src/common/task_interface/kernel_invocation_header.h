@@ -33,6 +33,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "execution_mode.h"
+
 enum {
     SIMPLER_KERNEL_INVOCATION_ABI_VERSION = 1,
 };

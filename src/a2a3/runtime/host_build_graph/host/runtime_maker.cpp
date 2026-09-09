@@ -77,6 +77,7 @@
 #include "common/unified_log.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -91,6 +92,11 @@ static_assert(
         PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
     "host-side C API codes must stay below the negation of every latched device code"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    // CallConfig alone cannot determine the graph-dependent heap and image sizes.
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -770,6 +776,29 @@ int32_t hbg::build_graph(
     build.heap_bytes = heap_bytes;
     build.ready = true;
     return total_tasks;
+}
+
+int32_t hbg::get_graph_resource_requirements(
+    const GraphBuild &build, const RuntimeArenaLayout &layout, GraphResourceRequirements &requirements
+) {
+    if (!build.ready || !build.graph_state || build.total_tasks < 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (layout.off_copied_begin > layout.off_copied_end || build.heap_bytes == 0 || build.image_bytes == 0) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    GraphResourceRequirements next{};
+    next.gm_heap_bytes = build.heap_bytes;
+    next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
+    if (!graph_definition_block_bytes(
+            graph_host_definitions(*build.graph_state), graph_host_arena_used(*build.graph_state),
+            next.graph_definition_bytes
+        )) {
+        return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    }
+    uint64_t total = 0;
+    if (!next.required_bytes(total)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    requirements = next;
+    return 0;
 }
 
 int32_t hbg::upload_program_graph(
