@@ -16,7 +16,8 @@
 #include <cstdint>
 #include <mutex>
 
-#include "runtime_c_api.h"
+#include "worker/runtime_c_api.h"
+#include "host/kernel_device_resources.h"
 
 /**
  * Which execution mode owns a device runner. A runner has exactly one mode
@@ -58,9 +59,16 @@ private:
     ClaimedExecutionMode mode_{ClaimedExecutionMode::Unclaimed};
 };
 
+enum class KernelStreamKind : size_t {
+    Aicpu = 0,
+    Aicore,
+    Count,
+};
+
 /**
- * Runtime operations owned by the kernel-context lifecycle — the complete
- * vocabulary available to context init and close.
+ * Handle operations owned by the kernel-context lifecycle — the complete
+ * vocabulary for creating/destroying streams and events. Device allocation
+ * and release are isolated in KernelResourceOps for resource prepare/close.
  *
  * Deliberately absent from this table: device/stream synchronization, device
  * reset, ACL finalization, capture queries, model handles, and
@@ -71,13 +79,13 @@ private:
 struct KernelContextOps {
     void *context{nullptr};
     int (*get_current_device)(void *context, int *device_id){nullptr};
-    int (*create_hidden_stream)(void *context, void **stream){nullptr};
-    int (*destroy_hidden_stream)(void *context, void *stream){nullptr};
+    int (*create_stream)(void *context, KernelStreamKind kind, void **stream){nullptr};
+    int (*destroy_stream)(void *context, KernelStreamKind kind, void *stream){nullptr};
     int (*create_event)(void *context, void **event){nullptr};
     int (*destroy_event)(void *context, void *event){nullptr};
 
     bool valid() const {
-        return get_current_device != nullptr && create_hidden_stream != nullptr && destroy_hidden_stream != nullptr &&
+        return get_current_device != nullptr && create_stream != nullptr && destroy_stream != nullptr &&
                create_event != nullptr && destroy_event != nullptr;
     }
 };
@@ -114,16 +122,11 @@ enum class KernelContextPhase : uint8_t {
     Closed,
 };
 
-enum class KernelStreamKind : size_t {
-    Aicpu = 0,
-    Aicore,
-    Count,
-};
-
 enum class KernelEventKind : size_t {
     PrepareTail = 0,
     Start,
     AicoreDone,
+    AicpuDone,
     SerialTail,
     Count,
 };
@@ -131,7 +134,7 @@ enum class KernelEventKind : size_t {
 /**
  * Context-lifetime state for the borrowed kernel execution mode.
  *
- * This object owns the persistent hidden stream pair and event set; every
+ * This object owns the dedicated AICPU stream, hidden AICore stream and event set; every
  * graph-visible persistent execution resource belongs here rather than in a
  * per-invocation object. The caller stream is never stored or destroyed —
  * each launch receives it as a borrowed argument.
@@ -155,8 +158,8 @@ enum class KernelEventKind : size_t {
  *
  * The destructor performs no runtime calls. If a caller skips explicit close
  * while an ACLGraph can still reference these handles, freeing them would be
- * a use-after-free; the public C API therefore refuses to destroy an
- * unclosed kernel runner and conservatively leaves it alive.
+ * a use-after-free; the public integration must retain an unclosed kernel
+ * runner and its allocator rather than invoke program teardown.
  */
 class KernelExecutionState {
 public:
@@ -165,7 +168,17 @@ public:
     KernelExecutionState(const KernelExecutionState &) = delete;
     KernelExecutionState &operator=(const KernelExecutionState &) = delete;
 
-    int initialize(int requested_device_id, const KernelContextOps &ops);
+    int initialize(int requested_device_id, const KernelContextOps &ops, uint64_t context_generation);
+    int prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops);
+    int freeze_resources();
+    // Caller serializes binding/enqueue with close, and keeps the context alive
+    // until all device work and captured graphs referencing these views end.
+    int bind_resources_for_launch(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
+    bool resources_prepared() const;
+    bool resources_frozen() const;
     int mark_ready_enqueued();
     void poison(int runtime_error);
     int close();
@@ -176,7 +189,7 @@ public:
     int last_runtime_error() const;
     int unexpected_teardown_error() const;
     bool has_live_resources() const;
-    void *hidden_stream(KernelStreamKind kind) const;
+    void *stream(KernelStreamKind kind) const;
     void *event(KernelEventKind kind) const;
 
 private:
@@ -186,9 +199,11 @@ private:
     mutable std::mutex mutex_;
     KernelContextPhase phase_{KernelContextPhase::New};
     int device_id_{-1};
+    uint64_t context_generation_{0};
+    KernelDeviceResources resources_;
     int last_runtime_error_{0};
     int unexpected_teardown_error_{0};
     KernelContextOps ops_{};
-    std::array<void *, static_cast<size_t>(KernelStreamKind::Count)> hidden_streams_{};
+    std::array<void *, static_cast<size_t>(KernelStreamKind::Count)> streams_{};
     std::array<void *, static_cast<size_t>(KernelEventKind::Count)> events_{};
 };
