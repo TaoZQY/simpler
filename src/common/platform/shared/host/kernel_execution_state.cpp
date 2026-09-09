@@ -47,10 +47,12 @@ bool ExecutionModeClaimState::accepts_kernel_calls() const { return mode() == Cl
 
 bool ExecutionModeClaimState::requires_explicit_kernel_close() const { return mode() == ClaimedExecutionMode::Kernel; }
 
-int KernelExecutionState::initialize(int requested_device_id, const KernelContextOps &ops) {
+int KernelExecutionState::initialize(
+    int requested_device_id, const KernelContextOps &ops, uint64_t context_generation
+) {
     std::scoped_lock lock(mutex_);
     if (phase_ != KernelContextPhase::New) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (requested_device_id < 0 || !ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
+    if (requested_device_id < 0 || context_generation == 0 || !ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
 
     int current_device = -1;
     int rc = ops.get_current_device(ops.context, &current_device);
@@ -60,9 +62,10 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
     phase_ = KernelContextPhase::Initializing;
     ops_ = ops;
     device_id_ = requested_device_id;
+    context_generation_ = context_generation;
 
-    for (auto &stream : hidden_streams_) {
-        rc = ops_.create_hidden_stream(ops_.context, &stream);
+    for (size_t i = 0; i < streams_.size(); ++i) {
+        rc = ops_.create_stream(ops_.context, static_cast<KernelStreamKind>(i), &streams_[i]);
         if (rc != 0) break;
     }
     if (rc == 0) {
@@ -131,6 +134,10 @@ int KernelExecutionState::close() {
 }
 
 int KernelExecutionState::cleanup_owned_resources_locked() {
+    // The caller has already established quiescence. Retain handles on memory
+    // cleanup failure so explicit close can retry without losing ownership.
+    const int memory_error = resources_.close();
+    if (memory_error != 0) return memory_error;
     int first_error = 0;
     for (size_t i = events_.size(); i > 0; --i) {
         void *&event = events_[i - 1];
@@ -142,10 +149,10 @@ int KernelExecutionState::cleanup_owned_resources_locked() {
         }
         event = nullptr;
     }
-    for (size_t i = hidden_streams_.size(); i > 0; --i) {
-        void *&stream = hidden_streams_[i - 1];
+    for (size_t i = streams_.size(); i > 0; --i) {
+        void *&stream = streams_[i - 1];
         if (stream == nullptr) continue;
-        const int rc = ops_.destroy_hidden_stream(ops_.context, stream);
+        const int rc = ops_.destroy_stream(ops_.context, static_cast<KernelStreamKind>(i - 1), stream);
         if (rc != 0) {
             if (first_error == 0) first_error = rc;
             continue;
@@ -186,7 +193,8 @@ bool KernelExecutionState::has_live_resources() const {
 }
 
 bool KernelExecutionState::has_live_resources_locked() const {
-    for (void *stream : hidden_streams_) {
+    if (resources_.has_live_resources()) return true;
+    for (void *stream : streams_) {
         if (stream != nullptr) return true;
     }
     for (void *event : events_) {
@@ -195,12 +203,60 @@ bool KernelExecutionState::has_live_resources_locked() const {
     return false;
 }
 
-void *KernelExecutionState::hidden_stream(KernelStreamKind kind) const {
+void *KernelExecutionState::stream(KernelStreamKind kind) const {
     std::scoped_lock lock(mutex_);
-    return hidden_streams_[static_cast<size_t>(kind)];
+    return streams_[static_cast<size_t>(kind)];
 }
 
 void *KernelExecutionState::event(KernelEventKind kind) const {
     std::scoped_lock lock(mutex_);
     return events_[static_cast<size_t>(kind)];
+}
+
+int KernelExecutionState::prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops) {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    int current_device = -1;
+    const int current_rc = ops_.get_current_device(ops_.context, &current_device);
+    if (current_rc != 0) return current_rc;
+    if (current_device != device_id_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = resources_.prepare(layout, ops);
+    } catch (...) {
+        // Host layout allocation may fail before any device mutation.
+    }
+    if (resources_.closing()) {
+        phase_ = KernelContextPhase::Closing;
+        if (unexpected_teardown_error_ == 0) unexpected_teardown_error_ = resources_.cleanup_error();
+    }
+    return rc;
+}
+
+int KernelExecutionState::freeze_resources() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.freeze();
+}
+
+int KernelExecutionState::bind_resources_for_launch(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::ReadyEnqueued || device_id != device_id_ || generation != context_generation_)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.bind(schema, required, count, out);
+}
+
+bool KernelExecutionState::resources_prepared() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.prepared();
+}
+
+bool KernelExecutionState::resources_frozen() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.frozen();
 }

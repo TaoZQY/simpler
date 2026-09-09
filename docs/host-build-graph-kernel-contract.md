@@ -71,6 +71,59 @@ another region has unused bytes. Queries and plan construction publish outputs
 only on success. Overflow returns `CAPACITY_EXCEEDED`; invalid build state or
 arguments fail before any resource mutation.
 
+`plan.prepare(context, resource_ops)` now passes this layout to
+`KernelExecutionState::prepare_resources`. The context owns the actual device
+allocations through `KernelDeviceResources`: one heap and one packed runtime
+arena. Definition and scheduler destinations are slices of that arena, so this
+path never calls the program allocator's `acquire_graph_definition_block` or
+its A5 per-run scheduler allocator. Base alignment and allocation-size overflow
+are checked before any device allocation. The common layout validator also
+rejects overlapping and out-of-bounds regions.
+
+Preparation is once per execution slot. Repeating prepare with compatible
+smaller requirements reuses both the old addresses and old offsets. A larger
+requirement is rejected even before freeze; collect the intended capacities
+before preparing the slot. Partial allocation failure releases the candidate;
+if cleanup itself fails, the context enters `CLOSING`, retains remaining
+allocations and rejects dispatch until explicit close retries succeed.
+
+`context.freeze_resources()` is a distinct transition, accepted only after
+successful resource preparation. `bind_kernel_resources_for_launch` then checks
+ready state, device/generation identity, the HBG region schema and each required
+size before returning `KernelWorkingBinding`. It does not allocate, free, copy,
+clear or replace any buffer. Mutable state must be restored later by the device
+from the invocation's immutable source. Caller must serialize binding/enqueue
+with close and establish external quiescence before closing.
+
+```cpp
+// All known graph requirements have already been collected outside capture.
+hbg::KernelResourcePlan plan;
+// Check each returned status before proceeding.
+hbg::KernelResourcePlan::create(graphs, graph_count, plan);
+plan.prepare(context, KernelResourceOps::from_allocator(allocator));
+// Enqueue device initialization/registration and establish its event ordering.
+context.mark_ready_enqueued();
+context.freeze_resources();
+
+// Resource portion of each launch: no allocator argument is available here.
+hbg::KernelWorkingBinding binding;
+hbg::bind_kernel_resources_for_launch(context, device_id, generation, graph, binding);
+```
+
+The allocator adapter uses the platform `MemoryAllocator`, preserving existing
+committed-byte accounting (including alignment slack). It must remain alive
+until explicit context close; neither its destructor nor program teardown may
+run while captured graphs reference the context. Context close releases only
+its own allocations, never caller tensors. External workspace injection remains
+deferred. Expanding a captured context requires a new generation and slot.
+
+The public K1 init/prepare/launch functions remain unsupported stubs: the
+resource lifecycle is implemented internally, but the immutable packet producer,
+public owner integration, registration and device restore are still required
+before enabling execution. K1 context-control FREEZE must delegate to this resource transition
+when the public context owner is connected; it must not merely set a flag on
+program arena banks. No wire layout or public entry point is added here.
+
 ## Common contract and stream roles
 
 `plan.pipeline_contract()` projects the complete capacity into existing kinds:
@@ -94,9 +147,11 @@ Validation retains the shared layers: ABI/mode/byte validation, serviceable aren
 and stream topology, then runtime-specific resource-set checks.
 `bind_kernel_stream_roles(contract, caller, aicpu, hidden_aicore, out)` preserves
 all three handles. Missing either execution role, invalid classes, null handles
-or any pair of aliased streams fails before publication. Context ownership,
-allocation, freeze and event enqueue remain separate integration work.
-The public K1 init/prepare/launch functions remain unsupported stubs.
+or any pair of aliased streams fails before publication. `KernelContextOps`
+receives the stream kind when creating/destroying a handle, allowing the owner
+to create a non-hidden AICPU stream and a hidden AICore stream separately.
+The context event set includes independent AICPU/AICore completion events.
+The actual event enqueue sequence is still part of launch integration.
 
 The no-argument C `get_pipeline_contract()` remains the static program contract
 with zero byte fields. The internal TMR-shaped

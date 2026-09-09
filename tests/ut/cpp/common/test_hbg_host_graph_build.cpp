@@ -635,4 +635,311 @@ TEST_F(HostGraphBuildTest, ConcurrentKernelQueriesPublishIndependentSnapshots) {
     EXPECT_EQ(platform.commits, 0);
 }
 
+struct ResourceContextPlatform {
+    int current_device{0};
+    uintptr_t next_handle{1};
+    int allocation_calls{0};
+    int free_calls{0};
+    int fail_allocation{0};
+    int free_failures{0};
+    std::vector<KernelStreamKind> stream_kinds;
+    MemoryAllocator allocator;
+
+    KernelContextOps context_ops() {
+        return {
+            this,
+            [](void *ctx, int *device) {
+                *device = static_cast<ResourceContextPlatform *>(ctx)->current_device;
+                return 0;
+            },
+            [](void *ctx, KernelStreamKind kind, void **stream) {
+                auto &self = *static_cast<ResourceContextPlatform *>(ctx);
+                self.stream_kinds.push_back(kind);
+                *stream = reinterpret_cast<void *>(self.next_handle++);
+                return 0;
+            },
+            [](void *, KernelStreamKind, void *) {
+                return 0;
+            },
+            [](void *ctx, void **event) {
+                *event = reinterpret_cast<void *>(static_cast<ResourceContextPlatform *>(ctx)->next_handle++);
+                return 0;
+            },
+            [](void *, void *) {
+                return 0;
+            }
+        };
+    }
+    KernelResourceOps resource_ops() {
+        return {
+            this,
+            [](void *ctx, size_t bytes) -> void * {
+                auto &self = *static_cast<ResourceContextPlatform *>(ctx);
+                if (++self.allocation_calls == self.fail_allocation) return nullptr;
+                return self.allocator.alloc(bytes);
+            },
+            [](void *ctx, void *ptr) {
+                auto &self = *static_cast<ResourceContextPlatform *>(ctx);
+                ++self.free_calls;
+                if (self.free_failures > 0) {
+                    --self.free_failures;
+                    return -77;
+                }
+                return self.allocator.free(ptr);
+            }
+        };
+    }
+};
+
+TEST_F(HostGraphBuildTest, KernelPrepareOwnsActualGraphCapacityAndLaunchOnlyBorrowsIt) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 19), 0);
+    ASSERT_EQ(
+        provider.stream_kinds, (std::vector<KernelStreamKind>{KernelStreamKind::Aicpu, KernelStreamKind::Aicore})
+    );
+    ASSERT_GE(build(graph_entry), 0);
+    hbg::GraphResourceRequirements graph;
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, graph), 0);
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+    EXPECT_TRUE(context.resources_prepared());
+    EXPECT_EQ(provider.allocation_calls, 2);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 2u);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(platform.commits, 0);
+    EXPECT_EQ(platform.definition_acquires, 0);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    hbg::KernelWorkingBinding binding;
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, graph, binding), 0);
+    EXPECT_NE(binding.heap.address, 0u);
+    EXPECT_EQ(binding.definitions.address, binding.runtime_image.address + plan.definition_offset());
+    EXPECT_EQ(binding.definitions.capacity, graph.graph_definition_bytes);
+    const auto first = binding;
+    const size_t committed = provider.allocator.committed_bytes();
+    std::memset(reinterpret_cast<void *>(binding.definitions.address), 0x5a, binding.definitions.capacity);
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+        ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, graph, binding), 0);
+        EXPECT_EQ(binding.heap.address, first.heap.address);
+        EXPECT_EQ(binding.runtime_image.address, first.runtime_image.address);
+        EXPECT_EQ(binding.definitions.address, first.definitions.address);
+        EXPECT_EQ(*reinterpret_cast<const uint8_t *>(binding.definitions.address), 0x5a);
+    }
+    EXPECT_EQ(provider.allocation_calls, 2);
+    EXPECT_EQ(provider.free_calls, 0);
+    EXPECT_EQ(provider.allocator.committed_bytes(), committed);
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(provider.allocator.committed_bytes(), 0u);
+    EXPECT_EQ(provider.free_calls, 2);
+}
+
+TEST(HbgKernelResourceContext, AggregatedCapacityRejectsExcessAndPreservesOffsetsForSmallerGraphs) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 23), 0);
+    const hbg::GraphResourceRequirements graphs[] = {{4096, 8192, 512, 0}, {8192, 4096, 0, 2048}};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(graphs, 2, plan), 0);
+    ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    hbg::KernelWorkingBinding first;
+    ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 23, plan.capacity(), first), 0);
+    EXPECT_EQ(first.scheduler.address, first.runtime_image.address + 9216);
+    for (const auto &graph : graphs) {
+        hbg::KernelResourcePlan smaller;
+        ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, smaller), 0);
+        ASSERT_EQ(smaller.prepare(context, provider.resource_ops()), 0);
+        hbg::KernelWorkingBinding binding;
+        ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 23, graph, binding), 0);
+        EXPECT_EQ(binding.scheduler.address, first.scheduler.address);
+        EXPECT_EQ(binding.definitions.address, first.definitions.address);
+    }
+    for (auto field :
+         {&hbg::GraphResourceRequirements::gm_heap_bytes, &hbg::GraphResourceRequirements::runtime_arena_bytes,
+          &hbg::GraphResourceRequirements::graph_definition_bytes,
+          &hbg::GraphResourceRequirements::scheduler_state_bytes}) {
+        auto excess = plan.capacity();
+        ++(excess.*field);
+        auto binding = first;
+        EXPECT_EQ(
+            hbg::bind_kernel_resources_for_launch(context, 0, 23, excess, binding), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED
+        );
+        EXPECT_EQ(binding.heap.address, first.heap.address);
+        EXPECT_EQ(binding.scheduler.address, first.scheduler.address);
+        hbg::KernelResourcePlan larger;
+        ASSERT_EQ(hbg::KernelResourcePlan::create(&excess, 1, larger), 0);
+        EXPECT_EQ(larger.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
+        ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 23, plan.capacity(), binding), 0);
+    }
+    EXPECT_EQ(provider.allocation_calls, 2);
+    EXPECT_EQ(provider.free_calls, 0);
+    ASSERT_EQ(context.close(), 0);
+}
+
+TEST(HbgKernelResourceContext, GuardsLifecycleDeviceAndGenerationBeforeBinding) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(context.initialize(0, provider.context_ops(), 0), PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 31), 0);
+    EXPECT_EQ(context.freeze_resources(), PTO_RUNTIME_ERR_INVALID_STATE);
+    provider.current_device = 1;
+    EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(provider.allocation_calls, 0);
+    provider.current_device = 0;
+    ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    EXPECT_EQ(context.freeze_resources(), PTO_RUNTIME_ERR_INVALID_STATE);
+    hbg::KernelWorkingBinding binding;
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 31, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 1, 31, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 32, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 31, graph, binding), 0);
+    context.poison(-45);
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 31, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 31, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+}
+
+TEST(HbgKernelResourceContext, AllocationFailureRollsBackAndCanBeRetried) {
+    for (int failure : {1, 2}) {
+        ResourceContextPlatform provider;
+        provider.fail_allocation = failure;
+        KernelExecutionState context;
+        ASSERT_EQ(context.initialize(0, provider.context_ops(), 41), 0);
+        const hbg::GraphResourceRequirements graph{4096, 8192, 512, 0};
+        hbg::KernelResourcePlan plan;
+        ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+        EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(provider.allocator.get_allocation_count(), 0u);
+        EXPECT_FALSE(context.resources_prepared());
+        EXPECT_FALSE(context.resources_frozen());
+        EXPECT_EQ(context.phase(), KernelContextPhase::Collecting);
+        provider.fail_allocation = 0;
+        ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+        ASSERT_EQ(context.close(), 0);
+        EXPECT_EQ(provider.allocator.get_allocation_count(), 0u);
+    }
+}
+
+TEST(HbgKernelResourceContext, FailedRollbackAndFailedCloseRetainOwnershipForRetry) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 43), 0);
+    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    provider.fail_allocation = 2;
+    provider.free_failures = 1;
+    EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(context.phase(), KernelContextPhase::Closing);
+    EXPECT_EQ(context.unexpected_teardown_error(), -77);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 1u);
+    EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INVALID_STATE);
+    provider.free_failures = 1;
+    EXPECT_EQ(context.close(), -77);
+    EXPECT_EQ(context.phase(), KernelContextPhase::Closing);
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 0u);
+    EXPECT_EQ(context.phase(), KernelContextPhase::Closed);
+}
+
+TEST(HbgKernelResourceContext, UsesThePlatformAllocatorAndReleasesOnlyContextOwnedBlocks) {
+    MemoryAllocator allocator;
+    void *tensor = allocator.alloc(64);
+    ASSERT_NE(tensor, nullptr);
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 47), 0);
+    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    ASSERT_EQ(plan.prepare(context, KernelResourceOps::from_allocator(allocator)), 0);
+    EXPECT_EQ(allocator.get_allocation_count(), 3u);
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(allocator.get_allocation_count(), 1u);
+    EXPECT_EQ(allocator.committed_bytes(), 64u);
+    EXPECT_EQ(allocator.free(tensor), 0);
+}
+
+TEST(HbgKernelResourceContext, InvalidLayoutsFailBeforeAnyDeviceAllocation) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 53), 0);
+    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 0};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    const KernelResourceLayout valid{
+        hbg::KernelResourcePlan::resource_schema,
+        plan.pipeline_contract(),
+        {{PTO_PIPELINE_GM_HEAP, 0, 4096},
+         {PTO_PIPELINE_RUNTIME_IMAGE, 0, 8192},
+         {PTO_PIPELINE_RUNTIME_IMAGE, 8192, 512},
+         {PTO_PIPELINE_RUNTIME_IMAGE, 0, 0}}
+    };
+    auto overlap = valid;
+    overlap.regions[2].offset = 1024;
+    EXPECT_EQ(context.prepare_resources(overlap, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+    auto outside = valid;
+    outside.regions[2].bytes = 1024;
+    EXPECT_EQ(context.prepare_resources(outside, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+    auto unaligned = valid;
+    unaligned.regions[2].offset = 8193;
+    EXPECT_EQ(context.prepare_resources(unaligned, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+    auto overflow = valid;
+    overflow.contract.resources[0].bytes_per_copy = UINT64_MAX;
+    EXPECT_EQ(context.prepare_resources(overflow, provider.resource_ops()), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
+    auto unknown = valid;
+    unknown.schema = 0;
+    EXPECT_EQ(context.prepare_resources(unknown, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(provider.allocation_calls, 0);
+    EXPECT_FALSE(context.resources_prepared());
+    ASSERT_EQ(context.prepare_resources(valid, provider.resource_ops()), 0);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    KernelResourceBinding binding;
+    const uint64_t required[] = {4096, 8192, 512, 0};
+    EXPECT_EQ(context.bind_resources_for_launch(0, 53, 123, required, 4, binding), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(binding.regions, nullptr);
+    ASSERT_EQ(context.close(), 0);
+}
+
+TEST(HbgKernelResourceContext, ConcurrentPrepareAllocatesOneSlotAndCloseFailureBlocksBinding) {
+    ResourceContextPlatform provider;
+    KernelExecutionState context;
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 59), 0);
+    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
+    auto prepare = [&] {
+        return plan.prepare(context, provider.resource_ops());
+    };
+    auto a = std::async(std::launch::async, prepare);
+    auto b = std::async(std::launch::async, prepare);
+    ASSERT_EQ(a.get(), 0);
+    ASSERT_EQ(b.get(), 0);
+    ASSERT_EQ(provider.allocation_calls, 2);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    provider.free_failures = 1;
+    EXPECT_EQ(context.close(), -77);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 1u);
+    hbg::KernelWorkingBinding binding;
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 59, graph, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(binding.heap.address, 0u);
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 0u);
+    EXPECT_EQ(provider.free_calls, 3);
+}
+
 }  // namespace
