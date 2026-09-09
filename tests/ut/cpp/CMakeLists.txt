@@ -537,8 +537,11 @@ set_tests_properties(test_kernel_ctx_control PROPERTIES LABELS "no_hardware")
 add_executable(test_kernel_execution_state
     common/test_kernel_execution_state.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp
 )
 target_include_directories(test_kernel_execution_state PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/worker
@@ -1006,6 +1009,9 @@ foreach(arch IN ITEMS a2a3 a5)
     endif()
     target_compile_definitions(${hbg_build_target} PRIVATE SIMPLER_PLATFORM_NAME="${arch}sim")
     target_sources(${hbg_build_target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/memory_allocator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/host_build_graph/host/runtime_maker.cpp
         ${HBG_SHARED_RUNTIME_SOURCES}
         ${HBG_HOST_DIR}/orchestrator.cpp

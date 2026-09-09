@@ -26,7 +26,7 @@ namespace {
 struct FakeContextOps {
     int current_device{3};
     int get_device_rc{0};
-    int create_stream_rc_after{-1};  // fail the Nth create_hidden_stream (0-based); -1 = never
+    int create_stream_rc_after{-1};  // fail the Nth create_stream (0-based); -1 = never
     int create_event_rc_after{-1};
     int destroy_failures_remaining{0};
 
@@ -44,14 +44,14 @@ struct FakeContextOps {
         *device_id = ops->current_device;
         return 0;
     }
-    static int create_hidden_stream(void *context, void **stream) {
+    static int create_stream(void *context, KernelStreamKind, void **stream) {
         auto *ops = self(context);
         if (ops->create_stream_rc_after >= 0 && ops->streams_created == ops->create_stream_rc_after) return -42;
         ops->streams_created++;
         *stream = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
-    static int destroy_hidden_stream(void *context, void *) {
+    static int destroy_stream(void *context, KernelStreamKind, void *) {
         auto *ops = self(context);
         if (ops->destroy_failures_remaining > 0) {
             ops->destroy_failures_remaining--;
@@ -78,7 +78,7 @@ struct FakeContextOps {
     }
 
     KernelContextOps table() {
-        return KernelContextOps{this,          &get_current_device, &create_hidden_stream, &destroy_hidden_stream,
+        return KernelContextOps{this,          &get_current_device, &create_stream, &destroy_stream,
                                 &create_event, &destroy_event};
     }
 };
@@ -131,14 +131,14 @@ TEST(KernelExecutionState, EmptyContextInitThenCloseIsClean) {
     FakeContextOps fake;
     KernelExecutionState state;
     EXPECT_EQ(state.phase(), KernelContextPhase::New);
-    EXPECT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), 0);
     EXPECT_EQ(state.phase(), KernelContextPhase::Collecting);
     EXPECT_TRUE(state.accepts_dispatch());
     EXPECT_EQ(state.device_id(), 3);
     EXPECT_EQ(fake.streams_created, static_cast<int>(kStreamCount));
     EXPECT_EQ(fake.events_created, static_cast<int>(kEventCount));
     for (size_t i = 0; i < kStreamCount; ++i) {
-        EXPECT_NE(state.hidden_stream(static_cast<KernelStreamKind>(i)), nullptr);
+        EXPECT_NE(state.stream(static_cast<KernelStreamKind>(i)), nullptr);
     }
     for (size_t i = 0; i < kEventCount; ++i) {
         EXPECT_NE(state.event(static_cast<KernelEventKind>(i)), nullptr);
@@ -162,31 +162,31 @@ TEST(KernelExecutionState, CloseOnNewContextIsANoOpSuccess) {
 TEST(KernelExecutionState, RepeatedInitializeRejected) {
     FakeContextOps fake;
     KernelExecutionState state;
-    EXPECT_EQ(state.initialize(3, fake.table()), 0);
-    EXPECT_EQ(state.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), 0);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(state.phase(), KernelContextPhase::Collecting);
 }
 
 TEST(KernelExecutionState, PreEnqueueValidationLeavesStateUnchanged) {
     FakeContextOps fake;
     KernelExecutionState state;
-    EXPECT_EQ(state.initialize(-1, fake.table()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(state.initialize(-1, fake.table(), 7), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(state.phase(), KernelContextPhase::New);
     KernelContextOps incomplete = fake.table();
     incomplete.destroy_event = nullptr;
-    EXPECT_EQ(state.initialize(3, incomplete), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(state.initialize(3, incomplete, 7), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(state.phase(), KernelContextPhase::New);
     EXPECT_EQ(fake.streams_created, 0);
     EXPECT_EQ(fake.events_created, 0);
     // The context stays usable after the clean rejections.
-    EXPECT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), 0);
 }
 
 TEST(KernelExecutionState, DeviceMismatchRejectedBeforeAnyCreation) {
     FakeContextOps fake;
     fake.current_device = 7;
     KernelExecutionState state;
-    EXPECT_EQ(state.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(state.phase(), KernelContextPhase::New);
     EXPECT_EQ(fake.streams_created, 0);
     EXPECT_EQ(fake.events_created, 0);
@@ -196,20 +196,20 @@ TEST(KernelExecutionState, PartialInitFailureRollsBackCleanly) {
     FakeContextOps fake;
     fake.create_event_rc_after = 1;  // second event creation fails
     KernelExecutionState state;
-    EXPECT_EQ(state.initialize(3, fake.table()), -44);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), -44);
     EXPECT_EQ(state.phase(), KernelContextPhase::New);
     EXPECT_FALSE(state.has_live_resources());
     EXPECT_EQ(fake.streams_destroyed, fake.streams_created);
     EXPECT_EQ(fake.events_destroyed, fake.events_created);
     // The rolled-back context is reusable.
     fake.create_event_rc_after = -1;
-    EXPECT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.initialize(3, fake.table(), 7), 0);
 }
 
 TEST(KernelExecutionState, ReadyEnqueuedKeepsAdmissionOpen) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     EXPECT_EQ(state.mark_ready_enqueued(), 0);
     EXPECT_EQ(state.phase(), KernelContextPhase::ReadyEnqueued);
     EXPECT_EQ(state.mark_ready_enqueued(), 0);  // append admission stays open
@@ -226,7 +226,7 @@ TEST(KernelExecutionState, MarkReadyEnqueuedRejectedOffPath) {
 TEST(KernelExecutionState, PoisonRejectsDispatchButAllowsClose) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     ASSERT_EQ(state.mark_ready_enqueued(), 0);
     state.poison(-7);
     EXPECT_EQ(state.phase(), KernelContextPhase::Poisoned);
@@ -250,7 +250,7 @@ TEST(KernelExecutionState, PoisonOutsideDispatchPhasesIsIgnored) {
 TEST(KernelExecutionState, PoisonDuringClosingIsIgnored) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     fake.destroy_failures_remaining = 1;
     ASSERT_EQ(state.close(), -43);
     ASSERT_EQ(state.phase(), KernelContextPhase::Closing);
@@ -262,7 +262,7 @@ TEST(KernelExecutionState, PoisonDuringClosingIsIgnored) {
 TEST(KernelExecutionState, PoisonAfterCloseIsIgnored) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     ASSERT_EQ(state.close(), 0);
     state.poison(-9);
     EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
@@ -273,35 +273,35 @@ TEST(KernelExecutionState, InitializeRejectedFromEveryNonNewPhase) {
     FakeContextOps fake;
 
     KernelExecutionState ready;
-    ASSERT_EQ(ready.initialize(3, fake.table()), 0);
+    ASSERT_EQ(ready.initialize(3, fake.table(), 7), 0);
     ASSERT_EQ(ready.mark_ready_enqueued(), 0);
-    EXPECT_EQ(ready.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(ready.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(ready.phase(), KernelContextPhase::ReadyEnqueued);
 
     KernelExecutionState poisoned;
-    ASSERT_EQ(poisoned.initialize(3, fake.table()), 0);
+    ASSERT_EQ(poisoned.initialize(3, fake.table(), 7), 0);
     poisoned.poison(-7);
-    EXPECT_EQ(poisoned.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(poisoned.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(poisoned.phase(), KernelContextPhase::Poisoned);
 
     KernelExecutionState closing;
-    ASSERT_EQ(closing.initialize(3, fake.table()), 0);
+    ASSERT_EQ(closing.initialize(3, fake.table(), 7), 0);
     fake.destroy_failures_remaining = 1;
     ASSERT_EQ(closing.close(), -43);
     ASSERT_EQ(closing.phase(), KernelContextPhase::Closing);
-    EXPECT_EQ(closing.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(closing.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(closing.phase(), KernelContextPhase::Closing);
 
     KernelExecutionState closed;
     EXPECT_EQ(closed.close(), 0);
-    EXPECT_EQ(closed.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(closed.initialize(3, fake.table(), 7), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(closed.phase(), KernelContextPhase::Closed);
 }
 
 TEST(KernelExecutionState, ClosingIsStickyAndRetriable) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     fake.destroy_failures_remaining = 2;
     const int rc = state.close();
     EXPECT_EQ(rc, -43);
@@ -322,7 +322,7 @@ TEST(KernelExecutionState, ClosingIsStickyAndRetriable) {
 TEST(KernelExecutionState, TeardownErrorSlotIsSeparateFromRuntimeError) {
     FakeContextOps fake;
     KernelExecutionState state;
-    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.initialize(3, fake.table(), 7), 0);
     state.poison(-7);
     fake.destroy_failures_remaining = 1;
     EXPECT_EQ(state.close(), -43);

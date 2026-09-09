@@ -17,6 +17,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/graph_host_state.h"
 #include "worker/pipeline_contract.h"
+#include "host/kernel_execution_state.h"
 #include "utils/device_arena.h"
 
 namespace hbg {
@@ -96,6 +97,22 @@ public:
                graph.scheduler_state_bytes <= capacity_.scheduler_state_bytes;
     }
 
+    // Only context resource prepare receives allocator operations. Launch gets
+    // stable views through bind_kernel_resources_for_launch below.
+    int prepare(KernelExecutionState &context, const KernelResourceOps &ops) const {
+        KernelResourceLayout layout{
+            resource_schema,
+            pipeline_contract(),
+            {{PTO_PIPELINE_GM_HEAP, 0, capacity_.gm_heap_bytes},
+             {PTO_PIPELINE_RUNTIME_IMAGE, 0, capacity_.runtime_arena_bytes},
+             {PTO_PIPELINE_RUNTIME_IMAGE, definition_offset_, capacity_.graph_definition_bytes},
+             {PTO_PIPELINE_RUNTIME_IMAGE, scheduler_offset_, capacity_.scheduler_state_bytes}},
+        };
+        return context.prepare_resources(layout, ops);
+    }
+
+    static constexpr uint64_t resource_schema = 0x4842470000000001ULL;
+
     PipelineContract pipeline_contract() const {
         return {
             PTO_PIPELINE_CONTRACT_ABI_VERSION,
@@ -127,6 +144,33 @@ private:
     uint64_t scheduler_offset_{0};
     uint64_t runtime_arena_bytes_{0};
 };
+
+// Borrowed addresses in the context's frozen execution slot. Device restore
+// writes invocation-specific state here; the Host never mutates it in launch.
+struct KernelWorkingBinding {
+    KernelResourceView heap;
+    KernelResourceView runtime_image;
+    KernelResourceView definitions;
+    KernelResourceView scheduler;
+};
+
+inline int bind_kernel_resources_for_launch(
+    const KernelExecutionState &context, int device_id, uint64_t generation, const GraphResourceRequirements &graph,
+    KernelWorkingBinding &out
+) {
+    uint64_t total = 0;
+    if (!graph.required_bytes(total)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+    const uint64_t required[] = {
+        graph.gm_heap_bytes, graph.runtime_arena_bytes, graph.graph_definition_bytes, graph.scheduler_state_bytes
+    };
+    KernelResourceBinding binding;
+    const int rc = context.bind_resources_for_launch(
+        device_id, generation, KernelResourcePlan::resource_schema, required, 4, binding
+    );
+    if (rc != 0) return rc;
+    out = {binding.regions[0], binding.regions[1], binding.regions[2], binding.regions[3]};
+    return 0;
+}
 
 // Same packing as bind_graph_definitions: retained prefix plus aligned spill
 // objects, each distinct Definition once regardless of its submission count.
