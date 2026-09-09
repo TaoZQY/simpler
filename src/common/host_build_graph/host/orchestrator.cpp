@@ -1286,6 +1286,13 @@ bool graph_host_rebind_staging(GraphHostState &state, void *base, size_t capacit
     return true;
 }
 
+const std::byte *graph_host_definition_data(const GraphHostState &state, uint64_t full_key) {
+    const auto it = state.definitions.find(full_key);
+    return it == state.definitions.end() ?
+               nullptr :
+               reinterpret_cast<const std::byte *>(graph_record_definition(state, it->second));
+}
+
 GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
     GraphHostDefinitionList list;
     list.entries.reserve(state.definitions.size());

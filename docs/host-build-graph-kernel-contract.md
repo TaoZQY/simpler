@@ -27,12 +27,18 @@ processing, including before a potentially failing copy. Repeated upload and
 retry therefore keep a valid source. Program execution still calls build and
 upload in sequence and retains its existing resource management.
 
+This borrowed intermediate is consumed by `make_graph_launch_template`, which
+produces an independently owned immutable packet. Kernel submission uses that
+packet and a prepared working slot, never the program upload path. Device
+registry validation and per-replay restore remain separate integration work.
+
 ## Graph requirements and context capacity
 
 After a successful build, call
 `hbg::get_graph_resource_requirements(build, layout, requirements)` with the
 layout of the intended destination for the same task window and runtime ABI.
-The layout must match the intended runtime destination. The query does no device
+Program mode uses its existing layout; kernel mode uses
+`make_kernel_graph_layout(build.task_capacity, layout)`. The query does no device
 allocation, address binding or H2D. It enumerates Host Definition records, so
 resource discovery runs outside capture.
 
@@ -118,8 +124,8 @@ its own allocations, never caller tensors. External workspace injection remains
 deferred. Expanding a captured context requires a new generation and slot.
 
 The public K1 init/prepare/launch functions remain unsupported stubs: the
-resource lifecycle is implemented internally, but the immutable packet producer,
-public owner integration, registration and device restore are still required
+resource lifecycle and immutable HBG packet producer are implemented internally,
+but public owner integration, registration and device restore are still required
 before enabling execution. K1 context-control FREEZE must delegate to this resource transition
 when the public context owner is connected; it must not merely set a flag on
 program arena banks. No wire layout or public entry point is added here.
@@ -160,6 +166,87 @@ CallConfig alone cannot determine a graph's sizes. HBG's owner must use the
 post-build query and capacity plan; contract consumers are shared, but the HBG
 and TMR sizing producers have different inputs. No mutable global size table or
 configuration-only fabricated HBG sizes are introduced.
+
+## Immutable graph packet and HostArgs submission
+
+`make_kernel_graph_layout(window, out)` reserves the existing runtime structures
+with each configurable scheduler queue sized to `next_power_of_two(max(window,
+64))`. The accepted window is 1 through 32768; a kernel graph must contain
+strictly fewer outer tasks than its window. Reachable in-graph task populations
+must also fit the queues. Overflow returns `CAPACITY_EXCEEDED`; no silent
+fallback to the program upload path exists. Program reservations retain their
+existing maximum capacities. TensorMap and orchestration scratch are Host-only
+in this implementation and are not serialized into a device arena.
+
+Collect graph requirements with this compact layout, aggregate them with
+`KernelResourcePlan`, then prepare and freeze the context. The capacity remains
+fixed while different graphs use different prefixes of it.
+`make_graph_launch_template(build, runtime, context, device_id, slot_generation,
+identity, out)` consumes the completed build under its workspace lease and:
+
+1. Checks readiness, graph/window bounds, identity, and frozen context binding.
+2. Allocates Host storage for a complete pristine image of every frozen runtime,
+   Definition and A5 scheduler region. Unused bytes are zero. No device memory
+   is allocated, accessed, cleared or copied by this operation.
+3. Emits a clean RuntimeContext with no Host/component pointers. Restacks SM
+   from the live Host mirror, preserving self-relative argument references and
+   translating virtual heap addresses onto the prepared device heap. External
+   tensor device addresses and scalar values retain their meanings.
+4. Copies each distinct retained/spilled Graph Definition, including framing,
+   into the packet and binds outer Graph tasks to the prepared Definition
+   destination. The source graph and staging are not patched.
+5. Publishes an owning `GraphLaunchTemplate` only after complete packet validation.
+   Failure preserves the previous template. Its source workspace may then be
+   reused or released; captured packets still require the device context/storage
+   and callable residency to remain alive.
+
+The canonical packet layout is:
+
+```text
+SimplerKernelInvocationHeader (64 bytes, unchanged K1 ABI)
+GraphPacketHeader            (192 bytes, HBG format version 1)
+GraphImageRegion[]           (32 bytes each)
+zero padding to a 64-byte relative offset
+inline payload:
+  full runtime/SM capacity
+  full Definition capacity, if nonzero
+  full A5 scheduler capacity, if nonzero
+```
+
+The HBG header carries context slot generation separately from K9's callable
+residency generation, identity hashes, task count/window, runtime/SM offsets and
+four destination base/capacity pairs. Region source offsets are relative to the
+inline payload; destination offsets are relative to the selected working region.
+The existing runtime image types retain their ABI. Their internal runtime
+pointers are null and rebuilt after restore; task heap/Definition references
+are bound to stable device destinations. Caller tensor contents are not copied.
+
+`validate_graph_packet` uses bounded `memcpy` reads, accepts an unaligned source,
+and checks framing before accessing the region table or payload: versions,
+counts, reserved fields, exact lengths, overflow, alignment, disjoint destination
+ranges, canonical region order and full-capacity coverage. A checksum covers the
+common header, HBG binding/identity, descriptors, padding and payload, excluding
+only the checksum and the single patched address. It detects accidental
+corruption; it cannot replace H3's independent device registry trust check or
+H4's semantic image validation and restore.
+
+`make_graph_host_args` validates the template and produces a fresh writable copy
+with one placeholder. Both placeholder offsets include the outer 64-byte header:
+`address_offset = 64 + offsetof(GraphPacketHeader, inline_payload_addr)` and
+`data_offset = 64 + payload_offset`. `submit_graph_template` passes that copy to
+a synchronous HostArgs consumer; only task execution is asynchronous.
+`aicpu_loader/host/kernel_graph_launch.h::launch_graph_template` adapts this to
+`aclrtLaunchKernelWithHostArgs`, forwarding the supplied dedicated AICPU stream,
+function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
+Enqueue errors are returned unchanged to the enclosing launch protocol.
+
+The adapter assumes the enclosing protocol has established entry/exit events
+and retained the function/context leases. It does not create streams, record
+or wait events, implement partial-enqueue recovery, or enable public K1 launch.
+The A5 scheduler region is a zeroed restore destination; its per-invocation
+metadata and scheduler initialization belong to device restore integration.
+Host framing/ownership tests and compilation against the installed CANN header
+are not evidence of on-device capture/restore correctness.
 
 ## Host tensor-data requirement semantics
 
