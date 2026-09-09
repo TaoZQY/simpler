@@ -30,7 +30,8 @@ upload in sequence and retains its existing resource management.
 This borrowed intermediate is consumed by `make_graph_launch_template`, which
 produces an independently owned immutable packet. Kernel submission uses that
 packet and a prepared working slot, never the program upload path. Device
-registry validation and per-replay restore remain separate integration work.
+admission checks the independently registered slot; per-replay restore remains
+separate integration work.
 
 ## Graph requirements and context capacity
 
@@ -60,14 +61,16 @@ code and CANN packets are outside this graph calculation.
 for one serialized execution slot. Inputs must belong to the same context's
 architecture and runtime layout ABI. It takes the maximum of each compatible
 region requirement, then **recomputes** aligned Definition and scheduler offsets
-after the runtime/SM capacity. It does not merge offsets or take the maximum of
+after the runtime/SM capacity. It then reserves a separate aligned
+`GraphSlotRegistry` control region, excluded from every restore image.
+It does not merge offsets or take the maximum of
 already-packed total sizes. The runtime/SM region accommodates one complete
 per-invocation image; its internal offsets must be bound from that invocation's
 layout during restore, never combined across graphs.
 
 For example, graph A needs runtime 8192 and Definition 512 bytes; graph B needs
 runtime 4096 and scheduler 2048 bytes. The combined arena reserves runtime
-`[0, 8192)`, Definition `[8192, 8704)`, padding, and scheduler `[9216, 11264)`.
+`[0, 8192)`, Definition `[8192, 8704)`, padding, scheduler `[9216, 11264)`, and registry `[11264, 11456)`.
 This is a legal layout for either graph; the larger individual packed total
 alone would not describe these combined region capacities.
 
@@ -80,7 +83,7 @@ arguments fail before any resource mutation.
 `plan.prepare(context, resource_ops)` now passes this layout to
 `KernelExecutionState::prepare_resources`. The context owns the actual device
 allocations through `KernelDeviceResources`: one heap and one packed runtime
-arena. Definition and scheduler destinations are slices of that arena, so this
+arena. Definition, scheduler and registry destinations are disjoint slices of that arena, so this
 path never calls the program allocator's `acquire_graph_definition_block` or
 its A5 per-run scheduler allocator. Base alignment and allocation-size overflow
 are checked before any device allocation. The common layout validator also
@@ -107,9 +110,10 @@ hbg::KernelResourcePlan plan;
 // Check each returned status before proceeding.
 hbg::KernelResourcePlan::create(graphs, graph_count, plan);
 plan.prepare(context, KernelResourceOps::from_allocator(allocator));
-// Enqueue device initialization/registration and establish its event ordering.
-context.mark_ready_enqueued();
 context.freeze_resources();
+hbg::prepare_graph_execution_slot(context, device_id, generation, runtime_binary_id, prepare_ops);
+// Order PrepareTail after all device initialization/registration tasks.
+context.mark_ready_enqueued();
 
 // Resource portion of each launch: no allocator argument is available here.
 hbg::KernelWorkingBinding binding;
@@ -125,7 +129,7 @@ deferred. Expanding a captured context requires a new generation and slot.
 
 The public K1 init/prepare/launch functions remain unsupported stubs: the
 resource lifecycle and immutable HBG packet producer are implemented internally,
-but public owner integration, registration and device restore are still required
+but public owner integration, kernel registration and device restore are still required
 before enabling execution. K1 context-control FREEZE must delegate to this resource transition
 when the public context owner is connected; it must not merely set a flag on
 program arena banks. No wire layout or public entry point is added here.
@@ -137,7 +141,7 @@ program arena banks. No wire layout or public entry point is added here.
 | Kind | Class | Bytes per copy / binding |
 | ---- | ----- | ------------------------ |
 | `GM_HEAP` | `HOST_PER_RUN` | Heap capacity |
-| `RUNTIME_IMAGE` | `HOST_PER_RUN` | Packed runtime/SM + Definition + scheduler capacity, including inter-region padding |
+| `RUNTIME_IMAGE` | `HOST_PER_RUN` | Packed runtime/SM + Definition + scheduler + registry capacity, including padding |
 | `AICPU_STREAM` | `EXEC_HANDLE` | Zero bytes; dedicated non-hidden AICPU stream |
 | `AICORE_STREAM` | `EXEC_HANDLE` | Zero bytes; use context-owned hidden AICore stream |
 
@@ -182,7 +186,7 @@ Collect graph requirements with this compact layout, aggregate them with
 `KernelResourcePlan`, then prepare and freeze the context. The capacity remains
 fixed while different graphs use different prefixes of it.
 `make_graph_launch_template(build, runtime, context, device_id, slot_generation,
-identity, out)` consumes the completed build under its workspace lease and:
+runtime_binary_id, identity, out)` consumes the completed build under its workspace lease and:
 
 1. Checks readiness, graph/window bounds, identity, and frozen context binding.
 2. Allocates Host storage for a complete pristine image of every frozen runtime,
@@ -204,7 +208,7 @@ The canonical packet layout is:
 
 ```text
 SimplerKernelInvocationHeader (64 bytes, unchanged K1 ABI)
-GraphPacketHeader            (192 bytes, HBG format version 1)
+GraphPacketHeader            (192 bytes, HBG format version 2)
 GraphImageRegion[]           (32 bytes each)
 zero padding to a 64-byte relative offset
 inline payload:
@@ -214,7 +218,8 @@ inline payload:
 ```
 
 The HBG header carries context slot generation separately from K9's callable
-residency generation, identity hashes, task count/window, runtime/SM offsets and
+residency generation, device ID, runtime binary identity, per-invocation hashes,
+task count/window, runtime/SM offsets and
 four destination base/capacity pairs. Region source offsets are relative to the
 inline payload; destination offsets are relative to the selected working region.
 The existing runtime image types retain their ABI. Their internal runtime
@@ -229,6 +234,12 @@ common header, HBG binding/identity, descriptors, padding and payload, excluding
 only the checksum and the single patched address. It detects accidental
 corruption; it cannot replace H3's independent device registry trust check or
 H4's semantic image validation and restore.
+
+[Execution-slot registration and admission](host-build-graph-kernel-slot.md)
+defines the prepare-time seal, context-owned AICPU registry and read-only
+`admit_graph_packet_for_restore` gate. The registry is not a graph/callable cache
+and no launch payload can choose its address. HBG version 1 packets are rejected;
+the outer K1 invocation ABI remains unchanged.
 
 `make_graph_host_args` validates the template and produces a fresh writable copy
 with one placeholder. Both placeholder offsets include the outer 64-byte header:
