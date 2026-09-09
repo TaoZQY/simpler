@@ -171,6 +171,12 @@ public:
     int initialize(int requested_device_id, const KernelContextOps &ops, uint64_t context_generation);
     int prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops);
     int freeze_resources();
+    // Capture-external sealing reads frozen addresses before init work is ready.
+    // The caller holds the context lease and serializes this operation with close.
+    int inspect_frozen_resources(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
     // Caller serializes binding/enqueue with close, and keeps the context alive
     // until all device work and captured graphs referencing these views end.
     int bind_resources_for_launch(

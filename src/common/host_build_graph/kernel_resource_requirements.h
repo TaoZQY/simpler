@@ -16,6 +16,7 @@
 
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/kernel_graph_slot_wire.h"
 #include "worker/pipeline_contract.h"
 #include "host/kernel_execution_state.h"
 #include "utils/device_arena.h"
@@ -75,6 +76,7 @@ public:
         uint64_t cursor = next.capacity_.runtime_arena_bytes;
         if (!append_region(next.capacity_.graph_definition_bytes, cursor, next.definition_offset_) ||
             !append_region(next.capacity_.scheduler_state_bytes, cursor, next.scheduler_offset_) ||
+            !append_region(sizeof(GraphSlotRegistry), cursor, next.registry_offset_) ||
             cursor > UINT64_MAX - next.capacity_.gm_heap_bytes) {
             return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
         }
@@ -86,6 +88,7 @@ public:
     const GraphResourceRequirements &capacity() const { return capacity_; }
     uint64_t definition_offset() const { return definition_offset_; }
     uint64_t scheduler_offset() const { return scheduler_offset_; }
+    uint64_t registry_offset() const { return registry_offset_; }
     uint64_t runtime_arena_bytes() const { return runtime_arena_bytes_; }
 
     bool admits(const GraphResourceRequirements &graph) const {
@@ -106,12 +109,13 @@ public:
             {{PTO_PIPELINE_GM_HEAP, 0, capacity_.gm_heap_bytes},
              {PTO_PIPELINE_RUNTIME_IMAGE, 0, capacity_.runtime_arena_bytes},
              {PTO_PIPELINE_RUNTIME_IMAGE, definition_offset_, capacity_.graph_definition_bytes},
-             {PTO_PIPELINE_RUNTIME_IMAGE, scheduler_offset_, capacity_.scheduler_state_bytes}},
+             {PTO_PIPELINE_RUNTIME_IMAGE, scheduler_offset_, capacity_.scheduler_state_bytes},
+             {PTO_PIPELINE_RUNTIME_IMAGE, registry_offset_, sizeof(GraphSlotRegistry)}},
         };
         return context.prepare_resources(layout, ops);
     }
 
-    static constexpr uint64_t resource_schema = 0x4842470000000001ULL;
+    static constexpr uint64_t resource_schema = 0x4842470000000002ULL;
 
     PipelineContract pipeline_contract() const {
         return {
@@ -142,6 +146,7 @@ private:
     GraphResourceRequirements capacity_{};
     uint64_t definition_offset_{0};
     uint64_t scheduler_offset_{0};
+    uint64_t registry_offset_{0};
     uint64_t runtime_arena_bytes_{0};
 };
 
@@ -161,11 +166,12 @@ inline int bind_kernel_resources_for_launch(
     uint64_t total = 0;
     if (!graph.required_bytes(total)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
     const uint64_t required[] = {
-        graph.gm_heap_bytes, graph.runtime_arena_bytes, graph.graph_definition_bytes, graph.scheduler_state_bytes
+        graph.gm_heap_bytes, graph.runtime_arena_bytes, graph.graph_definition_bytes, graph.scheduler_state_bytes,
+        sizeof(GraphSlotRegistry)
     };
     KernelResourceBinding binding;
     const int rc = context.bind_resources_for_launch(
-        device_id, generation, KernelResourcePlan::resource_schema, required, 4, binding
+        device_id, generation, KernelResourcePlan::resource_schema, required, 5, binding
     );
     if (rc != 0) return rc;
     out = {binding.regions[0], binding.regions[1], binding.regions[2], binding.regions[3]};

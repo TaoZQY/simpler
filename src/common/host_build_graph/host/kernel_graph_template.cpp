@@ -166,14 +166,15 @@ int make_kernel_graph_layout(uint64_t task_window, RuntimeArenaLayout &out) try 
 
 int make_graph_launch_template(
     const GraphBuild &build, const RuntimeContext &runtime, const KernelExecutionState &context, int device_id,
-    uint64_t slot_generation, const GraphInvocationIdentity &identity, GraphLaunchTemplate &out
+    uint64_t slot_generation, uint64_t runtime_binary_id, const GraphInvocationIdentity &identity,
+    GraphLaunchTemplate &out
 ) try {
     if (!build.ready || !build.graph_state || build.host_sm == nullptr || build.total_tasks < 0)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (identity.callable_id < 0 || identity.tensor_count < 0 || identity.scalar_count < 0 ||
         identity.tensor_count > CHIP_MAX_TENSOR_ARGS || identity.scalar_count > CHIP_MAX_SCALAR_ARGS ||
         identity.callable_generation == 0 || identity.callable_hash == 0 || identity.argument_hash == 0 ||
-        identity.function_hash == 0)
+        identity.function_hash == 0 || runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
     RuntimeArenaLayout layout{};
     int rc = make_kernel_graph_layout(build.task_capacity, layout);
@@ -198,6 +199,8 @@ int make_graph_launch_template(
     header.version = GRAPH_PACKET_VERSION;
     header.header_bytes = sizeof(header);
     header.slot_generation = slot_generation;
+    header.device_id = device_id;
+    header.runtime_binary_id = runtime_binary_id;
     header.callable_hash = identity.callable_hash;
     header.argument_hash = identity.argument_hash;
     header.function_hash = identity.function_hash;

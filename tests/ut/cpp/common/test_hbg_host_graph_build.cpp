@@ -17,6 +17,8 @@
 
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_graph_template.h"
+#include "host_build_graph/kernel_graph_slot.h"
+#include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/runtime_core.h"
@@ -469,13 +471,17 @@ TEST(HbgKernelResourcePlan, RebuildsDisjointRegionsFromCompatibleGraphMaxima) {
     EXPECT_EQ(plan.capacity().runtime_arena_bytes, 8192u);
     EXPECT_EQ(plan.definition_offset(), 8192u);
     EXPECT_EQ(plan.scheduler_offset(), 9216u);
-    EXPECT_EQ(plan.runtime_arena_bytes(), 11264u);
+    EXPECT_EQ(plan.registry_offset(), 11264u);
+    EXPECT_EQ(plan.runtime_arena_bytes(), 11264u + sizeof(hbg::GraphSlotRegistry));
     EXPECT_TRUE(plan.admits(graphs[0]));
     EXPECT_TRUE(plan.admits(graphs[1]));
     const auto contract = plan.pipeline_contract();
     ASSERT_TRUE(is_valid_hbg_kernel_pipeline_contract(&contract));
     EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_GM_HEAP)->bytes_per_copy, 8192u);
-    EXPECT_EQ(find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE)->bytes_per_copy, 11264u);
+    EXPECT_EQ(
+        find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE)->bytes_per_copy,
+        11264u + sizeof(hbg::GraphSlotRegistry)
+    );
 }
 
 TEST(HbgKernelResourcePlan, RejectsEachRegionOverCapacityWithoutChangingThePlan) {
@@ -892,7 +898,7 @@ TEST(HbgKernelResourceContext, InvalidLayoutsFailBeforeAnyDeviceAllocation) {
     overlap.regions[2].offset = 1024;
     EXPECT_EQ(context.prepare_resources(overlap, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
     auto outside = valid;
-    outside.regions[2].bytes = 1024;
+    outside.regions[2].bytes = plan.runtime_arena_bytes() - outside.regions[2].offset + 1;
     EXPECT_EQ(context.prepare_resources(outside, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
     auto unaligned = valid;
     unaligned.regions[2].offset = 8193;
@@ -968,7 +974,9 @@ protected:
         ASSERT_EQ(context.freeze_resources(), 0);
         ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, required, binding), 0);
     }
-    int snapshot_graph() { return hbg::make_graph_launch_template(result, *rt, context, 0, 19, identity, snapshot); }
+    int snapshot_graph() {
+        return hbg::make_graph_launch_template(result, *rt, context, 0, 19, 109, identity, snapshot);
+    }
     std::vector<std::byte> bytes() const {
         const auto *data = static_cast<const std::byte *>(snapshot.data());
         return {data, data + snapshot.size()};
@@ -1246,7 +1254,7 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
             h.destinations[1].address++;
         },
         [](auto &, auto &h, auto &) {
-            h.reserved[0] = 1;
+            h.reserved = 1;
         },
         [](auto &, auto &, auto &r) {
             r.source_offset = UINT64_MAX;
@@ -1437,6 +1445,430 @@ TEST_F(HbgGraphPacketTest, RealBuildAcceptsWindowMinusOneAndRejectsFullWindow) {
     ASSERT_EQ(build(packet_window_entry), capacity);
     EXPECT_EQ(snapshot_graph(), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
     EXPECT_EQ(bytes(), previous);
+}
+
+class HbgGraphSlotTest : public HbgGraphPacketTest {
+protected:
+    hbg::GraphSlotRegistration seal{};
+    hbg::GraphSlotRegistry *registry{nullptr};
+    hbg::GraphHostArgs packet;
+
+    static int install_slot(void *opaque, const hbg::GraphSlotRegistration &record, void *stream) {
+        auto &self = *static_cast<HbgGraphSlotTest *>(opaque);
+        EXPECT_EQ(stream, self.context.stream(KernelStreamKind::Aicpu));
+        EXPECT_NE(stream, self.context.stream(KernelStreamKind::Aicore));
+        const auto copy = record;
+        EXPECT_EQ(hbg::initialize_graph_slot_registry(self.registry, 0, 19, 109), hbg::GraphSlotStatus::Ok);
+        EXPECT_EQ(hbg::register_graph_execution_slot(self.registry, &copy, sizeof(copy)), hbg::GraphSlotStatus::Ok);
+        EXPECT_EQ(hbg::bind_graph_slot_registry(self.registry, 0, 109), hbg::GraphSlotStatus::Ok);
+        return 0;
+    }
+    void TearDown() override {
+        if (registry != nullptr) hbg::detach_graph_slot_registry(registry);
+        HbgGraphPacketTest::TearDown();
+    }
+    void prepare_slot(bool publish = true) {
+        ASSERT_GE(build(graph_entry), 0);
+        prepare();
+        ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
+        registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
+        ASSERT_EQ(hbg::initialize_graph_slot_registry(registry, 0, 19, 109), hbg::GraphSlotStatus::Ok);
+        if (publish) {
+            ASSERT_EQ(hbg::register_graph_execution_slot(registry, &seal, sizeof(seal)), hbg::GraphSlotStatus::Ok);
+            ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+        }
+        ASSERT_EQ(snapshot_graph(), 0);
+        ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+        patch();
+        for (size_t i = 0; i < 4; ++i)
+            if (seal.destinations[i].capacity != 0)
+                std::memset(
+                    reinterpret_cast<void *>(seal.destinations[i].address), 0x50 + i, seal.destinations[i].capacity
+                );
+    }
+    hbg::GraphPacketHeader &packet_header() {
+        return *reinterpret_cast<hbg::GraphPacketHeader *>(
+            reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader)
+        );
+    }
+    void patch() {
+        auto &h = packet_header();
+        h.inline_payload_addr = reinterpret_cast<uintptr_t>(packet.storage.data()) +
+                                sizeof(SimplerKernelInvocationHeader) + h.payload_offset;
+        h.checksum = hbg::graph_packet_checksum(packet.storage.data(), packet.bytes);
+    }
+    hbg::GraphSlotStatus admit(hbg::GraphRestoreView &view) {
+        return hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 109, view);
+    }
+    std::vector<std::byte> working_bytes() const {
+        std::vector<std::byte> data;
+        for (size_t i = 0; i < 5; ++i) {
+            const auto &region = i == 4 ? seal.registry : seal.destinations[i];
+            if (region.capacity == 0) continue;
+            const auto *first = reinterpret_cast<const std::byte *>(region.address);
+            data.insert(data.end(), first, first + region.capacity);
+        }
+        return data;
+    }
+    void expect_rejected(hbg::GraphSlotStatus expected) {
+        const auto before = working_bytes();
+        hbg::GraphRestoreView output{};
+        output.slot.slot_generation = 999;
+        output.payload = reinterpret_cast<const std::byte *>(uintptr_t{1});
+        EXPECT_EQ(admit(output), expected);
+        EXPECT_EQ(output.slot.slot_generation, 999u);
+        EXPECT_EQ(output.payload, reinterpret_cast<const std::byte *>(uintptr_t{1}));
+        EXPECT_EQ(working_bytes(), before);
+    }
+};
+
+TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStream) {
+    ASSERT_GE(build(chain_entry), 0);
+    RuntimeArenaLayout compact{};
+    ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, compact), 0);
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, compact, required), 0);
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&required, 1, plan), 0);
+    ASSERT_EQ(context.initialize(0, provider.context_ops(), 19), 0);
+    seal.slot_generation = 777;
+    EXPECT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+    EXPECT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(seal.slot_generation, 777u);
+    ASSERT_EQ(context.freeze_resources(), 0);
+    ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
+    EXPECT_EQ(context.phase(), KernelContextPhase::Collecting);
+    EXPECT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, required, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
+    EXPECT_EQ(seal.registry.capacity, sizeof(hbg::GraphSlotRegistry));
+    const int allocations = provider.allocation_calls;
+    const hbg::GraphSlotPrepareOps ops{this, install_slot};
+    ASSERT_EQ(hbg::prepare_graph_execution_slot(context, 0, 19, 109, ops), 0);
+    EXPECT_EQ(context.phase(), KernelContextPhase::Collecting);
+    ASSERT_EQ(context.mark_ready_enqueued(), 0);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    hbg::GraphRestoreView view;
+    ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(view.slot.slot_generation, 19u);
+    EXPECT_EQ(view.graph.runtime_binary_id, 109u);
+    EXPECT_EQ(view.slot.max_packet_bytes, packet.bytes);
+    EXPECT_EQ(provider.allocation_calls, allocations);
+    EXPECT_TRUE(platform.copies.empty());
+}
+
+TEST_F(HbgGraphSlotTest, SealFailurePreservesOutputAndDoesNotEnqueue) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = seal;
+    const hbg::GraphSlotPrepareOps ops{nullptr, [](void *, const auto &, void *) {
+                                           ADD_FAILURE() << "invalid prepare must not enqueue";
+                                           return 0;
+                                       }};
+    EXPECT_EQ(hbg::prepare_graph_execution_slot(context, 1, 19, 109, ops), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(hbg::prepare_graph_execution_slot(context, 0, 20, 109, ops), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 0, seal), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(std::memcmp(&seal, &original, sizeof(seal)), 0);
+    const hbg::GraphSlotPrepareOps failure{nullptr, [](void *, const auto &, void *) {
+                                               return -73;
+                                           }};
+    EXPECT_EQ(hbg::prepare_graph_execution_slot(context, 0, 19, 109, failure), -73);
+    context.poison(-17);
+    EXPECT_EQ(hbg::prepare_graph_execution_slot(context, 0, 19, 109, ops), PTO_RUNTIME_ERR_INVALID_STATE);
+}
+
+TEST_F(HbgGraphSlotTest, AdmitsOwnedPacketWithoutWritingWorkingMemoryOrRegistry) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto before = working_bytes();
+    hbg::GraphRestoreView view;
+    ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(std::memcmp(&view.slot, &seal, sizeof(seal)), 0);
+    EXPECT_EQ(view.payload, reinterpret_cast<const std::byte *>(packet_header().inline_payload_addr));
+    EXPECT_EQ(working_bytes(), before);
+    EXPECT_EQ(
+        hbg::validate_graph_packet(snapshot.data(), snapshot.size(), hbg::GraphPacketAddress::HostTemplate),
+        hbg::GraphPacketStatus::Ok
+    );
+}
+
+TEST_F(HbgGraphSlotTest, RejectsEveryForgedBaseEvenWithAValidPacketChecksum) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet;
+    for (size_t i = 0; i < 4; ++i) {
+        if (seal.destinations[i].capacity == 0) continue;
+        packet = original;
+        packet_header().destinations[i].address += 0x10000000000ULL;
+        patch();
+        ASSERT_EQ(
+            hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+            hbg::GraphPacketStatus::Ok
+        );
+        expect_rejected(hbg::GraphSlotStatus::BindingMismatch);
+    }
+}
+
+TEST_F(HbgGraphSlotTest, RejectsSmallerDeclaredCapacityInAnOtherwiseValidPacket) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    auto &header = packet_header();
+    size_t last = 3;
+    while (header.destinations[last].capacity == 0)
+        --last;
+    ASSERT_GT(header.destinations[last].capacity, 64u);
+    header.destinations[last].capacity -= 64;
+    header.payload_bytes -= 64;
+    header.total_bytes -= 64;
+    auto *regions = reinterpret_cast<hbg::GraphImageRegion *>(reinterpret_cast<std::byte *>(&header) + sizeof(header));
+    regions[header.region_count - 1].bytes -= 64;
+    auto *envelope = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data());
+    envelope->payload_bytes -= 64;
+    packet.bytes -= 64;
+    packet.storage.resize((packet.bytes + 7) / 8);
+    patch();
+    ASSERT_EQ(
+        hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::Ok
+    );
+    expect_rejected(hbg::GraphSlotStatus::BindingMismatch);
+}
+
+TEST_F(HbgGraphSlotTest, RejectsMisalignedOrStaleOrForeignIdentityBeforeAnyWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet;
+    using Mutate = void (*)(hbg::GraphPacketHeader &);
+    const std::pair<Mutate, hbg::GraphSlotStatus> cases[] = {
+        {[](auto &h) {
+             ++h.destinations[0].address;
+         },
+         hbg::GraphSlotStatus::InvalidPacket},
+        {[](auto &h) {
+             --h.slot_generation;
+         },
+         hbg::GraphSlotStatus::GenerationMismatch},
+        {[](auto &h) {
+             ++h.device_id;
+         },
+         hbg::GraphSlotStatus::DeviceMismatch},
+        {[](auto &h) {
+             ++h.runtime_binary_id;
+         },
+         hbg::GraphSlotStatus::BinaryMismatch},
+        {[](auto &h) {
+             h.version = 1;
+         },
+         hbg::GraphSlotStatus::InvalidPacket},
+    };
+    for (const auto &[mutate, expected] : cases) {
+        packet = original;
+        mutate(packet_header());
+        patch();
+        expect_rejected(expected);
+    }
+}
+
+TEST_F(HbgGraphSlotTest, RejectsSourceOverlapAndOversizedPacketsBeforeReadingPayload) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto before = working_bytes();
+    hbg::GraphRestoreView out;
+    for (const auto &destination : seal.destinations) {
+        if (destination.capacity == 0) continue;
+        EXPECT_EQ(
+            hbg::admit_graph_packet_for_restore(reinterpret_cast<const void *>(destination.address), 64, 0, 109, out),
+            hbg::GraphSlotStatus::SourceOverlap
+        );
+    }
+    EXPECT_EQ(hbg::admit_graph_packet_for_restore(registry, 64, 0, 109, out), hbg::GraphSlotStatus::SourceOverlap);
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), seal.max_packet_bytes + 1, 0, 109, out),
+        hbg::GraphSlotStatus::InvalidPacket
+    );
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), 1, 0, 109, out), hbg::GraphSlotStatus::InvalidPacket
+    );
+    EXPECT_EQ(working_bytes(), before);
+    EXPECT_EQ(out.payload, nullptr);
+}
+
+TEST_F(HbgGraphSlotTest, RegistrationIsIdempotentAndConflictsLeaveTheSealedSlotUntouched) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto before = working_bytes();
+    EXPECT_EQ(hbg::register_graph_execution_slot(registry, &seal, sizeof(seal)), hbg::GraphSlotStatus::Ok);
+    auto other = seal;
+    other.destinations[0].address += 0x10000000000ULL;
+    other.checksum = hbg::graph_slot_checksum(other);
+    ASSERT_TRUE(hbg::valid_graph_slot_registration(other));
+    EXPECT_EQ(hbg::register_graph_execution_slot(registry, &other, sizeof(other)), hbg::GraphSlotStatus::Conflict);
+    EXPECT_EQ(hbg::initialize_graph_slot_registry(registry, 0, 20, 109), hbg::GraphSlotStatus::Conflict);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, InvalidRegistrationCannotPublishAnyRegistryBytes) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot(false));
+    const auto before = working_bytes();
+    using Mutate = void (*)(hbg::GraphSlotRegistration &);
+    const Mutate cases[] = {
+        [](auto &s) {
+            ++s.version;
+        },
+        [](auto &s) {
+            s.flags = 0;
+        },
+        [](auto &s) {
+            s.slot_generation = 0;
+        },
+        [](auto &s) {
+            s.registry.address = s.destinations[1].address;
+        },
+        [](auto &s) {
+            s.destinations[0].capacity = UINT64_MAX;
+        },
+        [](auto &s) {
+            ++s.max_packet_bytes;
+        },
+        [](auto &s) {
+            s.runtime_binary_id = 0;
+        }
+    };
+    for (auto mutate : cases) {
+        auto invalid = seal;
+        mutate(invalid);
+        invalid.checksum = hbg::graph_slot_checksum(invalid);
+        EXPECT_EQ(
+            hbg::register_graph_execution_slot(registry, &invalid, sizeof(invalid)),
+            hbg::GraphSlotStatus::InvalidRegistration
+        );
+        EXPECT_EQ(working_bytes(), before);
+    }
+    EXPECT_EQ(
+        hbg::register_graph_execution_slot(registry, &seal, sizeof(seal) - 1), hbg::GraphSlotStatus::InvalidRegistration
+    );
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, EmptyPublishingAndCorruptRegistriesFailClosed) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot(false));
+    hbg::GraphSlotRegistration output{};
+    output.slot_generation = 999;
+    EXPECT_EQ(hbg::acquire_graph_execution_slot(registry, 0, 109, output), hbg::GraphSlotStatus::NotReady);
+    EXPECT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::NotReady);
+    expect_rejected(hbg::GraphSlotStatus::NotReady);
+    __atomic_store_n(&registry->phase, static_cast<uint32_t>(hbg::GraphSlotPhase::Publishing), __ATOMIC_RELEASE);
+    EXPECT_EQ(hbg::acquire_graph_execution_slot(registry, 0, 109, output), hbg::GraphSlotStatus::Publishing);
+    EXPECT_EQ(hbg::register_graph_execution_slot(registry, &seal, sizeof(seal)), hbg::GraphSlotStatus::Publishing);
+    __atomic_store_n(&registry->phase, 42u, __ATOMIC_RELEASE);
+    EXPECT_EQ(hbg::acquire_graph_execution_slot(registry, 0, 109, output), hbg::GraphSlotStatus::InvalidRegistry);
+    EXPECT_EQ(output.slot_generation, 999u);
+    ASSERT_EQ(hbg::initialize_graph_slot_registry(registry, 0, 19, 109), hbg::GraphSlotStatus::Ok);
+    ASSERT_EQ(hbg::register_graph_execution_slot(registry, &seal, sizeof(seal)), hbg::GraphSlotStatus::Ok);
+    ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+    registry->registration.checksum++;
+    expect_rejected(hbg::GraphSlotStatus::InvalidRegistry);
+}
+
+TEST_F(HbgGraphSlotTest, DetachedRegistryCannotAuthorizeReplayAndHasNoResidentGenerationHistory) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_TRUE(hbg::detach_graph_slot_registry(registry));
+    expect_rejected(hbg::GraphSlotStatus::NotReady);
+    auto next = seal;
+    ++next.slot_generation;
+    next.checksum = hbg::graph_slot_checksum(next);
+    ASSERT_EQ(hbg::initialize_graph_slot_registry(registry, 0, 20, 109), hbg::GraphSlotStatus::Ok);
+    ASSERT_EQ(hbg::register_graph_execution_slot(registry, &next, sizeof(next)), hbg::GraphSlotStatus::Ok);
+    ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+    expect_rejected(hbg::GraphSlotStatus::GenerationMismatch);
+    packet_header().slot_generation = 20;
+    patch();
+    hbg::GraphRestoreView view;
+    EXPECT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(view.slot.slot_generation, 20u);
+}
+
+TEST_F(HbgGraphSlotTest, InvocationIdentityMayVaryWithoutChangingTheRegisteredSlot) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    auto *envelope = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data());
+    ++envelope->callable_id;
+    ++envelope->generation;
+    ++packet_header().callable_hash;
+    ++packet_header().argument_hash;
+    ++packet_header().function_hash;
+    patch();
+    const auto before = working_bytes();
+    hbg::GraphRestoreView view;
+    ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, ConcurrentPublicationAndReadersSeeOnlyTheCompleteRecord) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot(false));
+    auto publish = [&] {
+        return hbg::register_graph_execution_slot(registry, &seal, sizeof(seal));
+    };
+    std::vector<std::future<hbg::GraphSlotStatus>> writers;
+    for (size_t i = 0; i < 16; ++i)
+        writers.push_back(std::async(std::launch::async, publish));
+    for (auto &writer : writers) {
+        const auto status = writer.get();
+        EXPECT_TRUE(status == hbg::GraphSlotStatus::Ok || status == hbg::GraphSlotStatus::Publishing);
+    }
+    ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+    const auto before = working_bytes();
+    std::vector<std::future<bool>> readers;
+    for (size_t i = 0; i < 16; ++i)
+        readers.push_back(std::async(std::launch::async, [&] {
+            hbg::GraphRestoreView view;
+            return admit(view) == hbg::GraphSlotStatus::Ok && std::memcmp(&view.slot, &seal, sizeof(seal)) == 0;
+        }));
+    for (auto &reader : readers)
+        EXPECT_TRUE(reader.get());
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, RegistryAddressAndExpectedRuntimeIdentityComeFromControlState) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    Buffer storage;
+    storage.reserve(sizeof(hbg::GraphSlotRegistry), DeviceArena::kDefaultBaseAlign);
+    auto *other = reinterpret_cast<hbg::GraphSlotRegistry *>(storage.data());
+    ASSERT_EQ(hbg::initialize_graph_slot_registry(other, 0, 19, 109), hbg::GraphSlotStatus::Ok);
+    const auto before = *other;
+    EXPECT_EQ(hbg::register_graph_execution_slot(other, &seal, sizeof(seal)), hbg::GraphSlotStatus::Conflict);
+    EXPECT_EQ(std::memcmp(&before, other, sizeof(before)), 0);
+    auto other_seal = seal;
+    other_seal.registry.address = reinterpret_cast<uintptr_t>(other);
+    other_seal.checksum = hbg::graph_slot_checksum(other_seal);
+    std::vector<std::byte> unaligned(sizeof(other_seal) + 1);
+    std::memcpy(unaligned.data() + 1, &other_seal, sizeof(other_seal));
+    ASSERT_EQ(
+        hbg::register_graph_execution_slot(other, unaligned.data() + 1, sizeof(other_seal)), hbg::GraphSlotStatus::Ok
+    );
+    EXPECT_EQ(hbg::bind_graph_slot_registry(other, 0, 109), hbg::GraphSlotStatus::Conflict);
+    EXPECT_FALSE(hbg::detach_graph_slot_registry(other));
+    hbg::GraphRestoreView view;
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 1, 109, view),
+        hbg::GraphSlotStatus::DeviceMismatch
+    );
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 110, view),
+        hbg::GraphSlotStatus::BinaryMismatch
+    );
+    EXPECT_EQ(view.payload, nullptr);
+    ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(view.slot.registry.address, seal.registry.address);
+}
+
+TEST_F(HbgGraphSlotTest, RejectsCorruptRegistryHeaderAndRetainsOwnershipUntilDetachAndClose) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    registry->reserved[0] = 1;
+    expect_rejected(hbg::GraphSlotStatus::InvalidRegistry);
+    registry->reserved[0] = 0;
+    registry->context_generation++;
+    expect_rejected(hbg::GraphSlotStatus::InvalidRegistry);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 2u);
+    ASSERT_TRUE(hbg::detach_graph_slot_registry(registry));
+    registry = nullptr;
+    ASSERT_EQ(context.close(), 0);
+    EXPECT_EQ(provider.allocator.get_allocation_count(), 0u);
+    hbg::GraphRestoreView view;
+    EXPECT_EQ(admit(view), hbg::GraphSlotStatus::NotReady);
 }
 
 }  // namespace
