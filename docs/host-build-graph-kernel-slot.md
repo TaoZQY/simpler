@@ -158,9 +158,10 @@ protection; this interface does not register a CANN entry or enqueue streams.
    checks read only the immutable packet, before any destination write. The
    existing Graph materialization consumer retains its topology and tensor-source
    semantic checks; restore is not a replacement for that consumer.
-2. Claim the registry's restore line and advance its device-owned attempt. The
-   context and callable generations are unchanged. Reject a busy line or exhausted
-   attempt counter; never wrap a generation to zero.
+2. Claim only an Idle restore line and advance its device-owned attempt. Ready
+   and Restoring reject with Busy; Failed rejects with Quarantined. Context and
+   callable generations are unchanged. Reject an exhausted attempt counter;
+   never wrap a generation to zero.
 3. Clear the full internal heap and copy each complete runtime/SM, Definition and
    optional A5 scheduler image. Copies cover frozen capacity, including the zero
    tails emitted by the Host template. Caller-owned tensor storage and persistent
@@ -170,35 +171,61 @@ protection; this interface does not register a CANN entry or enqueue streams.
    reset the completion mailbox. The separate A5 scheduler image is restored to
    its template; architecture-specific dispatch binding remains the kernel
    entry's responsibility.
-5. Flush every written region, then commit the attempt as the successful restore
-   generation and release-publish Ready. Return the RuntimeContext address,
+5. Flush every written region and the prepared control metadata before committing
+   the attempt as the successful restore generation and release-publishing Ready.
+   The memory backend can fail this pre-publication flush without committing.
+   Return the RuntimeContext address,
    capacity-bounded SM span and task count for the dispatch owner.
 
 The 64-byte `GraphRestoreControl` is part of the context registry allocation,
 never part of a graph image. Resource prepare still performs two physical
-allocations; launch/restore allocates nothing. Registration remains immutable
+allocations; resource binding and device restore allocate nothing. Host packet
+construction still owns vector storage and must not be described as an entirely
+allocation-free Host launch path. Registration remains immutable
 while its separate restore line changes. Old registry/resource schema versions
 fail closed; public K1 and HBG packet layouts are unchanged.
 
 A copy/clear/flush failure may leave partially written working bytes. It publishes
 Failed, preserves the last committed generation and leaves the output unchanged.
-There is no rollback and no dispatch permission. Retrying rewrites the complete
-working set. Native asynchronous execution failure still belongs to binder's
-Poisoned/cancel handling; a unit-test memory retry does not authorize reusing a
-poisoned native context.
+There is no rollback or dispatch permission. Direct retry is rejected while the
+slot is Failed. `retire_graph_restore(registry, attempt, completion)` checks the exact
+attempt, outcome and two independent error channels before making any transition:
+
+| Outcome | Required restore state | Result |
+| ------- | ---------------------- | ------ |
+| Completed | Ready, successful committed attempt | Idle, old peer result revoked |
+| ControlledFailure | Failed, known injected/controlled fault, clean teardown | Idle, full restore required next time |
+| FatalFailure | Ready or Failed | Terminal Poisoned registry; no retry |
+
+Retirement is an AICPU owner operation after all readers and AICore work are
+quiescent. On failure the entry must first make every peer skip classify/dispatch,
+run per-thread shutdown, completion gates and deinit (v9 section 10.2). The owner
+supplies runtime_status and unexpected_teardown_status independently in the
+completion record. Either nonzero status forces terminal poisoning, even when
+the outcome claims ControlledFailure or Completed. The owner also propagates
+poisoning to the Host context; controlled failure cannot hide either error. Retirement does not perform these cleanup operations itself.
+If rejection occurs before an attempt is claimed, the owner can poison the slot
+directly when the enclosing native invocation has already enqueued work.
+
+Unknown outcomes, stale attempts, duplicate retirement, success retirement of a
+failed slot, and all reuse of a Poisoned slot fail closed. Retirement never
+frees memory, resets the device or advances committed_generation.
 
 After its invocation barrier, a peer calls
 `acquire_graph_restore_result(registry, successful_generation, out)`. It acquires
-Ready, checks the exact attempt/commit pair, and invalidates every working region
+the validated, non-poisoned registry and Ready state, checks the exact
+attempt/commit pair and successful status, and invalidates every working region
 before consuming it. The entry must distribute the leader's status as well as
 its generation: on leader failure, peers exit through failure handling instead
 of polling an old Ready flag. A prevalidation rejection does not mint a new
 attempt and cannot authorize reuse of a prior successful output. The execution
-lease excludes the next restore until all readers and AICore work have completed.
+lease excludes retirement until all readers and AICore work have completed;
+the restore state machine independently refuses reuse before that retirement.
 
 Unit coverage includes repeated full-capacity restoration, corrupted first/middle/
 last source cache lines, forged runtime/relative-pool fields, every memory-operation
-failure, successful retry, stale publication rejection, peer readers and an empty
+failure (including the pre-publication flush), explicit controlled retry, stale
+retirement/publication rejection, terminal poisoning, peer readers and an empty
 image following a Graph image. These tests exercise the real restore implementation
 with Host-addressable memory on both architectures; they do not demonstrate CANN
 capture/replay or real-device cache coherence. Those require kernel-entry and binder

@@ -219,9 +219,10 @@ GraphRestoreStatus restore_graph_packet(
     const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out, const GraphRestoreOps &ops
 ) noexcept {
     GraphRestoreView view{};
-    if (admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id, trusted_callable, view) !=
-        GraphSlotStatus::Ok)
-        return GraphRestoreStatus::Rejected;
+    const auto admission =
+        admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id, trusted_callable, view);
+    if (admission == GraphSlotStatus::Poisoned) return GraphRestoreStatus::Poisoned;
+    if (admission != GraphSlotStatus::Ok) return GraphRestoreStatus::Rejected;
     RuntimeArenaLayout layout{};
     uint64_t sm_bytes = 0;
     if (!validate_images(view, layout, sm_bytes)) return GraphRestoreStatus::InvalidImage;
@@ -229,8 +230,11 @@ GraphRestoreStatus restore_graph_packet(
     auto &control = registry->restore;
     cache_invalidate_range(&control, sizeof(control));
     uint32_t phase = __atomic_load_n(&control.phase, __ATOMIC_ACQUIRE);
-    if (phase == static_cast<uint32_t>(GraphRestorePhase::Restoring)) return GraphRestoreStatus::Busy;
-    if (phase > static_cast<uint32_t>(GraphRestorePhase::Failed)) return GraphRestoreStatus::Rejected;
+    if (phase == static_cast<uint32_t>(GraphRestorePhase::Restoring) ||
+        phase == static_cast<uint32_t>(GraphRestorePhase::Ready))
+        return GraphRestoreStatus::Busy;
+    if (phase == static_cast<uint32_t>(GraphRestorePhase::Failed)) return GraphRestoreStatus::Quarantined;
+    if (phase != static_cast<uint32_t>(GraphRestorePhase::Idle)) return GraphRestoreStatus::Rejected;
     if (!__atomic_compare_exchange_n(
             &control.phase, &phase, static_cast<uint32_t>(GraphRestorePhase::Restoring), false, __ATOMIC_ACQ_REL,
             __ATOMIC_ACQUIRE
@@ -276,6 +280,7 @@ GraphRestoreStatus restore_graph_packet(
     control.runtime_address = reinterpret_cast<uintptr_t>(runtime);
     control.sm_bytes = sm_bytes;
     control.total_tasks = view.graph.total_tasks;
+    if (!flush_region(ops, &control, sizeof(control))) return fail();
     control.committed_generation = control.attempt;
     publish(control, GraphRestorePhase::Ready, GraphRestoreStatus::Ok);
     out = {runtime, control.attempt, sm_bytes, view.graph.total_tasks};
@@ -283,16 +288,61 @@ GraphRestoreStatus restore_graph_packet(
 }
 
 GraphRestoreStatus
+retire_graph_restore(GraphSlotRegistry *registry, uint64_t attempt, const GraphRestoreCompletion &completion) noexcept {
+    if (registry == nullptr || attempt == 0 || reinterpret_cast<uintptr_t>(registry) % 1024 != 0)
+        return GraphRestoreStatus::Rejected;
+    GraphSlotRegistration slot{};
+    const auto status = acquire_graph_execution_slot(registry, registry->device_id, registry->runtime_binary_id, slot);
+    if (status == GraphSlotStatus::Poisoned) return GraphRestoreStatus::Poisoned;
+    if (status != GraphSlotStatus::Ok) return GraphRestoreStatus::Rejected;
+    auto &control = registry->restore;
+    cache_invalidate_range(&control, sizeof(control));
+    uint32_t phase = __atomic_load_n(&control.phase, __ATOMIC_ACQUIRE);
+    if (phase == static_cast<uint32_t>(GraphRestorePhase::Restoring)) return GraphRestoreStatus::Busy;
+    if (control.attempt != attempt || (phase != static_cast<uint32_t>(GraphRestorePhase::Ready) &&
+                                       phase != static_cast<uint32_t>(GraphRestorePhase::Failed)))
+        return GraphRestoreStatus::NotReady;
+    const auto outcome = completion.outcome;
+    if (completion.runtime_status != 0 || completion.unexpected_teardown_status != 0 ||
+        outcome == GraphRestoreRetirement::FatalFailure) {
+        return poison_graph_execution_slot(registry) == GraphSlotStatus::Ok ? GraphRestoreStatus::Poisoned :
+                                                                              GraphRestoreStatus::Rejected;
+    }
+    const bool completed =
+        outcome == GraphRestoreRetirement::Completed && phase == static_cast<uint32_t>(GraphRestorePhase::Ready) &&
+        control.committed_generation == attempt && control.status == static_cast<uint32_t>(GraphRestoreStatus::Ok);
+    const bool controlled = outcome == GraphRestoreRetirement::ControlledFailure &&
+                            phase == static_cast<uint32_t>(GraphRestorePhase::Failed);
+    if (!completed && !controlled) return GraphRestoreStatus::Rejected;
+    if (!__atomic_compare_exchange_n(
+            &control.phase, &phase, static_cast<uint32_t>(GraphRestorePhase::Idle), false, __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE
+        ))
+        return GraphRestoreStatus::Busy;
+    cache_flush_range(&control, sizeof(control));
+    return GraphRestoreStatus::Ok;
+}
+
+GraphRestoreStatus
 acquire_graph_restore_result(const GraphSlotRegistry *registry, uint64_t generation, GraphRestoreResult &out) noexcept {
     if (registry == nullptr || generation == 0 || reinterpret_cast<uintptr_t>(registry) % 1024 != 0)
         return GraphRestoreStatus::NotReady;
+    GraphSlotRegistration slot{};
+    const auto status = acquire_graph_execution_slot(registry, registry->device_id, registry->runtime_binary_id, slot);
+    if (status == GraphSlotStatus::Poisoned) return GraphRestoreStatus::Poisoned;
+    if (status != GraphSlotStatus::Ok) return GraphRestoreStatus::NotReady;
     const auto &control = registry->restore;
     cache_invalidate_range(&control, sizeof(control));
     if (__atomic_load_n(&control.phase, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(GraphRestorePhase::Ready) ||
-        control.attempt != generation || control.committed_generation != generation || control.runtime_address == 0)
+        control.attempt != generation || control.committed_generation != generation ||
+        control.status != static_cast<uint32_t>(GraphRestoreStatus::Ok) ||
+        control.runtime_address < slot.destinations[1].address ||
+        !graph_span_fits(
+            control.runtime_address - slot.destinations[1].address, sizeof(RuntimeContext),
+            slot.destinations[1].capacity
+        ))
         return GraphRestoreStatus::NotReady;
-    cache_invalidate_range(&registry->registration, sizeof(registry->registration));
-    for (const auto &dst : registry->registration.destinations)
+    for (const auto &dst : slot.destinations)
         if (dst.capacity) cache_invalidate_range(reinterpret_cast<const void *>(dst.address), dst.capacity);
     out = {
         reinterpret_cast<RuntimeContext *>(control.runtime_address), generation, control.sm_bytes, control.total_tasks

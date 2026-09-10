@@ -16,7 +16,26 @@ struct RuntimeContext;
 
 namespace hbg {
 
-enum class GraphRestoreStatus : uint32_t { Ok, Rejected, InvalidImage, Busy, Exhausted, CopyFailed, NotReady };
+enum class GraphRestoreStatus : uint32_t {
+    Ok,
+    Rejected,
+    InvalidImage,
+    Busy,
+    Exhausted,
+    CopyFailed,
+    NotReady,
+    Quarantined,
+    Poisoned
+};
+
+enum class GraphRestoreRetirement : uint32_t { Completed, ControlledFailure, FatalFailure };
+
+// Independent error channels from the enclosing execution and cleanup owner.
+struct GraphRestoreCompletion {
+    GraphRestoreRetirement outcome;
+    int runtime_status{0};
+    int unexpected_teardown_status{0};
+};
 
 struct GraphRestoreResult {
     RuntimeContext *runtime{nullptr};
@@ -38,13 +57,22 @@ struct GraphRestoreOps {
 // The owner excludes prior execution/readers, serializes this entire operation
 // with close/registration, and retains immutable packet/callable storage.
 // Source admission and image checks finish before any destination is written.
-// Failed copies leave working bytes unusable; a retry restores every region.
+// Ready remains occupied until retirement; Failed remains quarantined until
+// controlled cleanup or terminal poisoning. Every admitted retry restores all regions.
 // out changes only on success. This function neither launches nor synchronizes.
 GraphRestoreStatus restore_graph_packet(
     const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
     const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out,
     const GraphRestoreOps &ops = {}
 ) noexcept;
+
+// Called after all participants have skipped dispatch on failure, shut down,
+// passed completion gates and deinitialized, and all AICore/readers are quiescent.
+// Only a known controlled fault with no runtime/teardown error permits retry.
+// Native errors require FatalFailure and Host context poisoning; no reset/free.
+// The owner serializes this with restore, registration, poisoning and close.
+GraphRestoreStatus
+retire_graph_restore(GraphSlotRegistry *registry, uint64_t attempt, const GraphRestoreCompletion &completion) noexcept;
 
 // The kernel entry distributes the successful leader's generation through its
 // per-invocation barrier. Peers must never sample an unversioned old Ready flag.

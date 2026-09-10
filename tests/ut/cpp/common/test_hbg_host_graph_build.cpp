@@ -1959,6 +1959,11 @@ protected:
     hbg::GraphRestoreStatus restore(const hbg::GraphRestoreOps &ops = {}) {
         return hbg::restore_graph_packet(packet.storage.data(), packet.bytes, 0, 109, trusted_callable, restored, ops);
     }
+    void retire(hbg::GraphRestoreRetirement outcome = hbg::GraphRestoreRetirement::Completed) {
+        ASSERT_EQ(
+            hbg::retire_graph_restore(registry, registry->restore.attempt, {outcome}), hbg::GraphRestoreStatus::Ok
+        );
+    }
     void dirty_working() {
         for (const auto &dst : seal.destinations)
             if (dst.capacity) std::memset(reinterpret_cast<void *>(dst.address), 0xa5, dst.capacity);
@@ -1982,6 +1987,7 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacit
     EXPECT_EQ(queue.slots[queue.capacity - 1].sequence.load(), queue.capacity - 1);
     const auto expected = mutable_bytes();
     for (uint64_t iteration = 2; iteration <= 16; ++iteration) {
+        ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
         ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.runtime, runtime);
@@ -2057,10 +2063,11 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
     for (const auto &dst : seal.destinations)
         regions += dst.capacity != 0;
     const auto expected = mutable_bytes();
-    for (int fail_at = 1; fail_at <= 2 * regions; ++fail_at) {
+    for (int fail_at = 1; fail_at <= 2 * regions + 1; ++fail_at) {
         const uint64_t previous = restored.generation;
         const auto output = restored;
         Fault fault{0, fail_at};
+        ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
         EXPECT_EQ(restore({&fault, Fault::copy, Fault::zero, Fault::flush}), hbg::GraphRestoreStatus::CopyFailed);
         EXPECT_EQ(restored.generation, output.generation);
@@ -2069,6 +2076,8 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
         EXPECT_EQ(registry->restore.phase, static_cast<uint32_t>(hbg::GraphRestorePhase::Failed));
         hbg::GraphRestoreResult peer;
         EXPECT_EQ(hbg::acquire_graph_restore_result(registry, previous, peer), hbg::GraphRestoreStatus::NotReady);
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Quarantined);
+        ASSERT_NO_FATAL_FAILURE(retire(hbg::GraphRestoreRetirement::ControlledFailure));
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.generation, previous + 2);
         EXPECT_EQ(mutable_bytes(), expected);
@@ -2106,6 +2115,7 @@ TEST_F(HbgGraphRestoreTest, SmallerAndEmptyGraphsClearPreviousWorkingState) {
     // fallback for the nonempty graph. Prepare accounts for both variants.
     ASSERT_NO_FATAL_FAILURE(prepare_slot(true, empty.scheduler_state_bytes));
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(retire());
     ASSERT_EQ(build(empty_entry), 0);
     ASSERT_EQ(snapshot_graph(), 0);
     ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
@@ -2196,4 +2206,171 @@ TEST_F(HbgGraphSlotTest, SourceVisibilityFailureAndInvalidBoundsNeverAuthorizeRe
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(view.slot.slot_generation, 999u);
     EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, ReadyExecutionCannotBeOverwrittenBeforeRetirement) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    const auto before = working_bytes();
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Busy);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, FailedRestoreCannotRetryWithoutCleanup) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    hbg::GraphRestoreOps ops;
+    ops.zero = [](void *, void *, size_t) {
+        return false;
+    };
+    ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
+    const auto before = working_bytes();
+    EXPECT_NE(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, PoisonedRegistryRevokesPublishedPeerResult) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_EQ(hbg::poison_graph_execution_slot(registry), hbg::GraphSlotStatus::Ok);
+    hbg::GraphRestoreResult peer;
+    EXPECT_NE(hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(peer.runtime, nullptr);
+}
+
+TEST_F(HbgGraphRestoreTest, RetirementRequiresMatchingAttemptAndOutcome) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    const auto first = restored.generation;
+    const auto before = working_bytes();
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, first + 1, {hbg::GraphRestoreRetirement::Completed}),
+        hbg::GraphRestoreStatus::NotReady
+    );
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, first, {hbg::GraphRestoreRetirement::ControlledFailure}),
+        hbg::GraphRestoreStatus::Rejected
+    );
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, first, {static_cast<hbg::GraphRestoreRetirement>(99)}),
+        hbg::GraphRestoreStatus::Rejected
+    );
+    EXPECT_EQ(working_bytes(), before);
+    ASSERT_NO_FATAL_FAILURE(retire());
+    hbg::GraphRestoreResult peer;
+    EXPECT_EQ(hbg::acquire_graph_restore_result(registry, first, peer), hbg::GraphRestoreStatus::NotReady);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, first, {hbg::GraphRestoreRetirement::Completed}),
+        hbg::GraphRestoreStatus::NotReady
+    );
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, first, {hbg::GraphRestoreRetirement::Completed}),
+        hbg::GraphRestoreStatus::NotReady
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Busy);
+}
+
+TEST_F(HbgGraphRestoreTest, RejectionAfterRetirementCannotExposePreviousSuccess) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(retire());
+    const auto before = working_bytes();
+    reinterpret_cast<std::byte *>(packet.storage.data())[packet.bytes - 1] ^= std::byte{0x80};
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+    EXPECT_EQ(working_bytes(), before);
+    hbg::GraphRestoreResult peer;
+    EXPECT_EQ(
+        hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::NotReady
+    );
+}
+
+TEST_F(HbgGraphRestoreTest, PublishFailureIsQuarantinedAndFatalCleanupCannotRetry) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    hbg::GraphRestoreOps ops;
+    ops.context = registry;
+    ops.flush = [](void *opaque, const void *address, size_t bytes) {
+        const auto *r = static_cast<const hbg::GraphSlotRegistry *>(opaque);
+        if (address != &r->restore) return true;
+        EXPECT_EQ(bytes, sizeof(r->restore));
+        EXPECT_EQ(r->restore.committed_generation, 0u);
+        EXPECT_EQ(r->restore.phase, static_cast<uint32_t>(hbg::GraphRestorePhase::Restoring));
+        return false;
+    };
+    EXPECT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
+    EXPECT_EQ(registry->restore.committed_generation, 0u);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::Completed}),
+        hbg::GraphRestoreStatus::Rejected
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Quarantined);
+    const auto before = mutable_bytes();
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::FatalFailure}),
+        hbg::GraphRestoreStatus::Poisoned
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(
+            registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::ControlledFailure}
+        ),
+        hbg::GraphRestoreStatus::Poisoned
+    );
+    EXPECT_EQ(mutable_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, FatalExecutionAfterSuccessfulRestoreRevokesPeerAccess) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(registry, restored.generation, {hbg::GraphRestoreRetirement::FatalFailure}),
+        hbg::GraphRestoreStatus::Poisoned
+    );
+    hbg::GraphRestoreResult peer;
+    EXPECT_EQ(
+        hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::Poisoned
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
+}
+
+TEST_F(HbgGraphRestoreTest, PeerValidatesRegistryBeforeInvalidatingWorkingAddresses) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    registry->registration.destinations[0].address = 1;
+    hbg::GraphRestoreResult peer;
+    EXPECT_EQ(
+        hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::NotReady
+    );
+    EXPECT_EQ(peer.runtime, nullptr);
+}
+
+TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideNativeRuntimeError) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    hbg::GraphRestoreOps ops;
+    ops.zero = [](void *, void *, size_t) {
+        return false;
+    };
+    ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(
+            registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::ControlledFailure, -71, 0}
+        ),
+        hbg::GraphRestoreStatus::Poisoned
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
+}
+
+TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideUnexpectedTeardownError) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    hbg::GraphRestoreOps ops;
+    ops.zero = [](void *, void *, size_t) {
+        return false;
+    };
+    ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
+    EXPECT_EQ(
+        hbg::retire_graph_restore(
+            registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::ControlledFailure, 0, -72}
+        ),
+        hbg::GraphRestoreStatus::Poisoned
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
 }
