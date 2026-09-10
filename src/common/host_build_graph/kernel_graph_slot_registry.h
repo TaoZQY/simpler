@@ -34,6 +34,17 @@ GraphSlotStatus
 bind_graph_slot_registry(GraphSlotRegistry *registry, int device_id, uint64_t runtime_binary_id) noexcept;
 bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept;
 
+// Serialized with control/restore/retirement by the invocation owner. Terminal:
+// no register, bind, admission or retirement may make this storage usable again.
+GraphSlotStatus poison_graph_execution_slot(GraphSlotRegistry *registry) noexcept;
+
+struct GraphPacketReadOps {
+    void *context{nullptr};
+    // Covers the complete task-owned packet after trusted size/overlap checks,
+    // before its first byte is parsed. Null selects device cache invalidation.
+    bool (*invalidate)(void *, const void *, size_t){nullptr};
+};
+
 // Read-only admission result. The packet and registry stay immutable/alive while
 // the caller uses it. Image semantics, restoration and dispatch are separate.
 struct GraphRestoreView {
@@ -50,7 +61,8 @@ struct GraphRestoreView {
 // On failure: no slot write, generation publication, or output modification.
 GraphSlotStatus admit_graph_packet_for_restore(
     const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
-    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreView &out
+    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreView &out,
+    const GraphPacketReadOps &ops = {}
 ) noexcept;
 
 }  // namespace hbg

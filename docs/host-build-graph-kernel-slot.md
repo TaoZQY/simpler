@@ -1,7 +1,7 @@
 # HBG execution-slot registration and admission
 
 These internal interfaces implement the execution-slot trust root described in
-[v9 and the H3 pipeline card](https://icc.gt.tc/vllm-pto#pipeline). Public kernel
+[v9 design, sections 3 and 8](https://icc.gt.tc/vllm-pto?i=1#v9-design). Public kernel
 init/prepare/launch and the registered CANN kernel entry points are not enabled
 by these interfaces. The owner connects the control callbacks and event ordering;
 The leader restore consumes admission to validate and restore image contents.
@@ -83,6 +83,12 @@ After graph destruction and external quiescence, device control must detach that
 pointer before `context.close()` releases memory. H3 exposes detachment; the
 public close/registration owner still needs to connect this ordered operation.
 
+`poison_graph_execution_slot` publishes a terminal Poisoned registration phase.
+Register, bind and admission reject it. Initialization still requires a new
+allocation lifetime; it must not be used to reset a failed live context. The invocation owner serializes poisoning with registration,
+restore and retirement; it also propagates the native error to the Host context.
+Poisoning neither drains device work nor frees resources or resets the device.
+
 ## Invocation admission
 
 HBG packet version 2 uses the former reserved tail of its 192-byte header for
@@ -103,7 +109,8 @@ trusted_callable, out)`:
    identity, publication state, registration checksum and context/slot generation.
 2. Bounds packet size before parsing its payload and rejects source overlap with
    any working or registry region.
-3. Validates the common invocation header against the trusted callable view, then
+3. Invalidates the complete bounded task-owned source before the first packet
+   read, then validates the common invocation header against the trusted callable view, then
    runs the full HBG framing, placeholder-address, region and checksum validation
    in DeviceCopy mode.
 4. Compares packet device, slot generation, runtime binary identity and every
@@ -112,6 +119,8 @@ trusted_callable, out)`:
    header and payload view only after every check succeeds.
 
 Failure leaves the output, registry, working memory and generation unchanged.
+An optional synchronous source-visibility operation supports backend testing;
+its failure also rejects admission. Size and overlap checks precede that operation.
 A packet with a recomputed checksum still cannot authorize a changed binding.
 Admission neither copies images nor releases AICore/scheduler work.
 `restore_graph_packet` performs the subsequent image validation and restoration;

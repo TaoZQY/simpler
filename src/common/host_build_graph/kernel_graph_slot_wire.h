@@ -19,7 +19,7 @@ inline constexpr uint32_t GRAPH_REGISTRY_MAGIC = 0x52474248;  // HBGR
 inline constexpr uint16_t GRAPH_SLOT_VERSION = 2;
 inline constexpr uint32_t GRAPH_SLOT_FROZEN_SERIAL = 3;
 
-enum class GraphSlotPhase : uint32_t { Empty, Publishing, Ready };
+enum class GraphSlotPhase : uint32_t { Empty, Publishing, Ready, Poisoned };
 enum class GraphSlotStatus : uint32_t {
     Ok,
     InvalidRegistration,
@@ -33,7 +33,9 @@ enum class GraphSlotStatus : uint32_t {
     InvalidPacket,
     BindingMismatch,
     SourceOverlap,
-    CallableMismatch
+    CallableMismatch,
+    Poisoned,
+    SourceUnavailable
 };
 
 // Sealed only from context-owned frozen allocations, never from a launch packet.

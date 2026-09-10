@@ -2134,3 +2134,66 @@ TEST_F(HbgGraphRestoreTest, BusyAndExhaustedControlCannotWriteWorkingImages) {
     registry->restore.attempt = UINT64_MAX;
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Exhausted);
 }
+
+TEST_F(HbgGraphSlotTest, InvalidatesCompleteTaskPacketBeforeParsing) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto fresh = packet.storage;
+    const auto before = working_bytes();
+    std::memset(packet.storage.data(), 0xa5, packet.bytes);
+    struct Visibility {
+        const std::vector<uint64_t> &fresh;
+        const void *address;
+        size_t bytes;
+        int calls{0};
+    } visibility{fresh, packet.storage.data(), packet.bytes};
+    const hbg::GraphPacketReadOps ops{&visibility, [](void *opaque, const void *address, size_t bytes) {
+                                          auto &v = *static_cast<Visibility *>(opaque);
+                                          EXPECT_EQ(address, v.address);
+                                          EXPECT_EQ(bytes, v.bytes);
+                                          ++v.calls;
+                                          std::memcpy(const_cast<void *>(address), v.fresh.data(), bytes);
+                                          return true;
+                                      }};
+    hbg::GraphRestoreView view;
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 109, trusted_callable, view, ops),
+        hbg::GraphSlotStatus::Ok
+    );
+    EXPECT_EQ(visibility.calls, 1);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, PoisonIsTerminalAcrossBindRegisterAndReinitialize) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(hbg::poison_graph_execution_slot(registry), hbg::GraphSlotStatus::Ok);
+    const auto before = working_bytes();
+    expect_rejected(hbg::GraphSlotStatus::Poisoned);
+    EXPECT_EQ(hbg::register_graph_execution_slot(registry, &seal, sizeof(seal)), hbg::GraphSlotStatus::Poisoned);
+    EXPECT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Poisoned);
+    EXPECT_EQ(hbg::initialize_graph_slot_registry(registry, 0, 19, 109), hbg::GraphSlotStatus::Conflict);
+    ASSERT_TRUE(hbg::detach_graph_slot_registry(registry));
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, SourceVisibilityFailureAndInvalidBoundsNeverAuthorizeRestore) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto before = working_bytes();
+    int calls = 0;
+    const hbg::GraphPacketReadOps ops{&calls, [](void *opaque, const void *, size_t) {
+                                          ++*static_cast<int *>(opaque);
+                                          return false;
+                                      }};
+    hbg::GraphRestoreView view;
+    view.slot.slot_generation = 999;
+    auto check = [&](const void *address, size_t bytes) {
+        return hbg::admit_graph_packet_for_restore(address, bytes, 0, 109, trusted_callable, view, ops);
+    };
+    EXPECT_EQ(check(packet.storage.data(), packet.bytes), hbg::GraphSlotStatus::SourceUnavailable);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(check(packet.storage.data(), 1), hbg::GraphSlotStatus::InvalidPacket);
+    EXPECT_EQ(check(packet.storage.data(), seal.max_packet_bytes + 1), hbg::GraphSlotStatus::InvalidPacket);
+    EXPECT_EQ(check(registry, packet.bytes), hbg::GraphSlotStatus::SourceOverlap);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(view.slot.slot_generation, 999u);
+    EXPECT_EQ(working_bytes(), before);
+}
