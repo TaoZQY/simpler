@@ -4,19 +4,19 @@ These internal interfaces implement the execution-slot trust root described in
 [v9 and the H3 pipeline card](https://icc.gt.tc/vllm-pto#pipeline). Public kernel
 init/prepare/launch and the registered CANN kernel entry points are not enabled
 by these interfaces. The owner connects the control callbacks and event ordering;
-H4 consumes the admission result to validate and restore image contents.
+The leader restore consumes admission to validate and restore image contents.
 
 ## Ownership and prepare
 
 `KernelResourcePlan` reserves five logical regions within two physical allocations:
-heap, runtime/SM, Definitions, A5 scheduler, and a 192-byte registry. The last
+heap, runtime/SM, Definitions, A5 scheduler, and a 256-byte registry. The last
 four occupy disjoint aligned slices of the packed runtime arena. The registry
 adds its bytes and preceding alignment padding to the common resource contract,
 but never to a graph's four mutable destination capacities or its payload.
 `GraphResourceRequirements` remains a per-graph size snapshot; the plan accounts
 for the additional per-context control storage.
 
-The resource schema is version 2. Prepare and close retain existing allocator
+The resource schema is version 3; slot registration uses version 2. Prepare and close retain existing allocator
 accounting and rollback behavior. No third allocation or launch-time allocation
 is introduced. Different graphs use one frozen set of destination addresses and
 capacities. Registry storage has the same context lifetime as those destinations.
@@ -62,9 +62,10 @@ All nonempty bases are aligned, lengths are overflow-checked, and all five regio
 are disjoint. The runtime binary identity must be stable for the registered
 runtime/ABI; it is not a callable ID, argument hash or context generation.
 
-`GraphSlotRegistry` is a 192-byte POD aligned to a cache line. Its first line
+`GraphSlotRegistry` is a 256-byte POD aligned to a cache line. Its first line
 holds the context identity and publication state; the next two lines hold the
-registration. Device control code initializes only newly allocated, exclusively
+registration. A fourth, independent cache line holds per-execution restore
+publication. Device control code initializes only newly allocated, exclusively
 owned storage, then publishes `Empty -> Publishing -> Ready`. The complete
 candidate is checked before claiming Publishing. Ready is release-published
 only after copying and flushing the record. Acquisition checks state, invalidates
@@ -112,9 +113,9 @@ trusted_callable, out)`:
 
 Failure leaves the output, registry, working memory and generation unchanged.
 A packet with a recomputed checksum still cannot authorize a changed binding.
-Admission neither copies images nor releases AICore/scheduler work. H4 must
-validate internal image semantics, restore full mutable capacity and publish a
-successful restore verdict; launch integration handles cancellation on failure.
+Admission neither copies images nor releases AICore/scheduler work.
+`restore_graph_packet` performs the subsequent image validation and restoration;
+launch integration handles cancellation on failure.
 The task-owned source and context must remain alive and immutable while the
 admission result is consumed.
 
@@ -133,3 +134,63 @@ stores only context resources, not a duplicate callable registry. Packet
 `generation` is checked against callable residency; graph `slot_generation`
 is checked independently against context registration. Neither counter proves
 resource lifetime. Rejection preserves the output and every destination byte.
+
+## Leader restore and execution publication
+
+`restore_graph_packet(packet, bytes, device_id, runtime_binary_id,
+trusted_callable, out, ops)` runs on the AICPU leader after Start and before
+any scheduler dispatch or AICore window publication. Eager and replay use the
+same entry. The enclosing kernel entry supplies invocation barriers and lifetime
+protection; this interface does not register a CANN entry or enqueue streams.
+
+1. Run callable and execution-slot admission. Validate canonical runtime layout,
+   null Host pointers, task counts, relative argument spans, dependency indices,
+   packed heap ranges and referenced Definition framing/section bounds. These
+   checks read only the immutable packet, before any destination write. The
+   existing Graph materialization consumer retains its topology and tensor-source
+   semantic checks; restore is not a replacement for that consumer.
+2. Claim the registry's restore line and advance its device-owned attempt. The
+   context and callable generations are unchanged. Reject a busy line or exhausted
+   attempt counter; never wrap a generation to zero.
+3. Clear the full internal heap and copy each complete runtime/SM, Definition and
+   optional A5 scheduler image. Copies cover frozen capacity, including the zero
+   tails emitted by the Host template. Caller-owned tensor storage and persistent
+   platform handshake/KernelArgs allocations are outside these regions.
+4. Wire runtime/SM/scheduler pointers against the registered destinations, attach
+   the populated SM, initialize scheduler queue headers and sequence ramps, and
+   reset the completion mailbox. The separate A5 scheduler image is restored to
+   its template; architecture-specific dispatch binding remains the kernel
+   entry's responsibility.
+5. Flush every written region, then commit the attempt as the successful restore
+   generation and release-publish Ready. Return the RuntimeContext address,
+   capacity-bounded SM span and task count for the dispatch owner.
+
+The 64-byte `GraphRestoreControl` is part of the context registry allocation,
+never part of a graph image. Resource prepare still performs two physical
+allocations; launch/restore allocates nothing. Registration remains immutable
+while its separate restore line changes. Old registry/resource schema versions
+fail closed; public K1 and HBG packet layouts are unchanged.
+
+A copy/clear/flush failure may leave partially written working bytes. It publishes
+Failed, preserves the last committed generation and leaves the output unchanged.
+There is no rollback and no dispatch permission. Retrying rewrites the complete
+working set. Native asynchronous execution failure still belongs to binder's
+Poisoned/cancel handling; a unit-test memory retry does not authorize reusing a
+poisoned native context.
+
+After its invocation barrier, a peer calls
+`acquire_graph_restore_result(registry, successful_generation, out)`. It acquires
+Ready, checks the exact attempt/commit pair, and invalidates every working region
+before consuming it. The entry must distribute the leader's status as well as
+its generation: on leader failure, peers exit through failure handling instead
+of polling an old Ready flag. A prevalidation rejection does not mint a new
+attempt and cannot authorize reuse of a prior successful output. The execution
+lease excludes the next restore until all readers and AICore work have completed.
+
+Unit coverage includes repeated full-capacity restoration, corrupted first/middle/
+last source cache lines, forged runtime/relative-pool fields, every memory-operation
+failure, successful retry, stale publication rejection, peer readers and an empty
+image following a Graph image. These tests exercise the real restore implementation
+with Host-addressable memory on both architectures; they do not demonstrate CANN
+capture/replay or real-device cache coherence. Those require kernel-entry and binder
+integration.

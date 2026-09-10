@@ -30,8 +30,9 @@ upload in sequence and retains its existing resource management.
 This borrowed intermediate is consumed by `make_graph_launch_template`, which
 produces an independently owned immutable packet. Kernel submission uses that
 packet and a prepared working slot, never the program upload path. Device
-admission checks the independently registered slot; per-replay restore remains
-separate integration work.
+admission checks the independently registered slot and trusted callable metadata.
+The leader restores the packet into that slot before dispatch; see
+[execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 ## Graph requirements and context capacity
 
@@ -70,7 +71,7 @@ layout during restore, never combined across graphs.
 
 For example, graph A needs runtime 8192 and Definition 512 bytes; graph B needs
 runtime 4096 and scheduler 2048 bytes. The combined arena reserves runtime
-`[0, 8192)`, Definition `[8192, 8704)`, padding, scheduler `[9216, 11264)`, and registry `[11264, 11456)`.
+`[0, 8192)`, Definition `[8192, 8704)`, padding, scheduler `[9216, 11264)`, and registry `[11264, 11520)`.
 This is a legal layout for either graph; the larger individual packed total
 alone would not describe these combined region capacities.
 
@@ -129,7 +130,7 @@ deferred. Expanding a captured context requires a new generation and slot.
 
 The public K1 init/prepare/launch functions remain unsupported stubs: the
 resource lifecycle and immutable HBG packet producer are implemented internally,
-but public owner integration, kernel registration and device restore are still required
+but public owner integration and kernel registration are still required
 before enabling execution. K1 context-control FREEZE must delegate to this resource transition
 when the public context owner is connected; it must not merely set a flag on
 program arena banks. No wire layout or public entry point is added here.
@@ -233,7 +234,8 @@ ranges, canonical region order and full-capacity coverage. A checksum covers the
 common header, HBG binding/identity, descriptors, padding and payload, excluding
 only the checksum and the single patched address. It detects accidental
 corruption; it cannot replace H3's independent device registry trust check or
-H4's semantic image validation and restore.
+the leader image validation and restore described in
+[execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 
 [Execution-slot registration and admission](host-build-graph-kernel-slot.md)
 defines the prepare-time seal, context-owned AICPU registry and read-only
@@ -254,8 +256,9 @@ Enqueue errors are returned unchanged to the enclosing launch protocol.
 The adapter assumes the enclosing protocol has established entry/exit events
 and retained the function/context leases. It does not create streams, record
 or wait events, implement partial-enqueue recovery, or enable public K1 launch.
-The A5 scheduler region is a zeroed restore destination; its per-invocation
-metadata and scheduler initialization belong to device restore integration.
+The A5 scheduler region is restored from its zeroed template. The common
+scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;
+A5 dispatch-specific metadata binding remains with the kernel entry.
 Host framing/ownership tests and compilation against the installed CANN header
 are not evidence of on-device capture/restore correctness.
 
