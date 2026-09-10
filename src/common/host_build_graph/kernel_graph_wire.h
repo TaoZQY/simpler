@@ -16,7 +16,7 @@
 #include <type_traits>
 
 #include "task_interface/kernel_invocation_header.h"
-#include "task_interface/arg_direction.h"
+#include "task_interface/kernel_invocation_validation.h"
 #include "utils/fnv1a_64.h"
 
 namespace hbg {
@@ -116,11 +116,11 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
     SimplerKernelInvocationHeader invocation{};
     std::memcpy(&invocation, bytes, sizeof(invocation));
     if (invocation.abi_version != SIMPLER_KERNEL_INVOCATION_ABI_VERSION || invocation.header_bytes != prefix ||
-        invocation.mode != SIMPLER_MODE_KERNEL || invocation.callable_id < 0 || invocation.generation == 0 ||
-        invocation.tensor_count < 0 || invocation.tensor_count > CHIP_MAX_TENSOR_ARGS || invocation.scalar_count < 0 ||
-        invocation.scalar_count > CHIP_MAX_SCALAR_ARGS || invocation.host_copy_tensor_count != 0 ||
-        invocation.reserved0 != 0 || invocation.reserved[0] != 0 || invocation.reserved[1] != 0 ||
-        invocation.payload_bytes != size - prefix)
+        invocation.mode != SIMPLER_MODE_KERNEL || invocation.callable_id < 0 ||
+        invocation.callable_id >= MAX_REGISTERED_CALLABLE_IDS || invocation.generation == 0 ||
+        !simpler::kernel::valid_invocation_counts(invocation.tensor_count, invocation.scalar_count) ||
+        invocation.host_copy_tensor_count != 0 || invocation.reserved0 != 0 || invocation.reserved[0] != 0 ||
+        invocation.reserved[1] != 0 || invocation.payload_bytes != size - prefix)
         return GraphPacketStatus::InvalidEnvelope;
     GraphPacketHeader header{};
     std::memcpy(&header, bytes + prefix, sizeof(header));

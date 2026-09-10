@@ -88,18 +88,22 @@ HBG packet version 2 uses the former reserved tail of its 192-byte header for
 device ID and runtime binary identity. The outer 64-byte K1 header is unchanged.
 Version 1 packets fail closed. Callable generation, callable/argument/function
 hashes remain per-invocation fields, so different callables and arguments can
-share a slot. This gate does not authenticate their function tables or signatures.
+share a slot. The common callable admission checks ID, effective argument counts and residency
+generation against an independently validated live registration. Function-table
+resolution remains the callable owner’s responsibility.
 
 The device and runtime binary arguments come from trusted AICPU initialization,
 not from the packet being checked.
 
-`admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id, out)`:
+`admit_graph_packet_for_restore(packet, bytes, device_id, runtime_binary_id,
+trusted_callable, out)`:
 
 1. Acquires the independently latched registry, checking device, runtime binary
    identity, publication state, registration checksum and context/slot generation.
 2. Bounds packet size before parsing its payload and rejects source overlap with
    any working or registry region.
-3. Runs the full HBG framing, placeholder-address, region and checksum validation
+3. Validates the common invocation header against the trusted callable view, then
+   runs the full HBG framing, placeholder-address, region and checksum validation
    in DeviceCopy mode.
 4. Compares packet device, slot generation, runtime binary identity and every
    destination base/capacity pair with the sealed record.
@@ -113,3 +117,19 @@ validate internal image semantics, restore full mutable capacity and publish a
 successful restore verdict; launch integration handles cancellation on failure.
 The task-owned source and context must remain alive and immutable while the
 admission result is consumed.
+
+## Shared callable admission
+
+The shared `PreparedInvocationView`, `ByteSpan`, effective-count derivation and
+`validate_invocation_header` interfaces follow K4 PR #2180 at `b0943525`.
+That prerequisite uses a 40-byte envelope; this stack retains its frozen
+64-byte envelope, including ABI version, header size and reserved-word checks.
+Integrators must reconcile the envelope ABI before combining the branches;
+these are not interchangeable binary layouts.
+
+The callable owner supplies the view under submission/consumption protection,
+coordinated with prepare replacement and close. The HBG execution registry
+stores only context resources, not a duplicate callable registry. Packet
+`generation` is checked against callable residency; graph `slot_generation`
+is checked independently against context registration. Neither counter proves
+resource lifetime. Rejection preserves the output and every destination byte.

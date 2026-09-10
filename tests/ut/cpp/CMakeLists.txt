@@ -999,6 +999,11 @@ set(HBG_ORCH_SHARED_SOURCES
     ${CMAKE_SOURCE_DIR}/stubs/hbg_orch_stubs.cpp
     ${HBG_SHARED_RUNTIME_SOURCES}
 )
+add_executable(test_kernel_invocation_validation types/test_kernel_invocation_validation.cpp)
+target_include_directories(test_kernel_invocation_validation PRIVATE ${GTEST_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface)
+target_link_libraries(test_kernel_invocation_validation PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_invocation_validation COMMAND test_kernel_invocation_validation)
+
 add_a2a3_hbg_runtime_test(test_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_host_graph_build common/test_hbg_host_graph_build.cpp)
 foreach(arch IN ITEMS a2a3 a5)

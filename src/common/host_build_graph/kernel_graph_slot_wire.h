@@ -32,7 +32,8 @@ enum class GraphSlotStatus : uint32_t {
     BinaryMismatch,
     InvalidPacket,
     BindingMismatch,
-    SourceOverlap
+    SourceOverlap,
+    CallableMismatch
 };
 
 // Sealed only from context-owned frozen allocations, never from a launch packet.

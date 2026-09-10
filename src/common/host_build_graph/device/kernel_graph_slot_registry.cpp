@@ -126,7 +126,8 @@ bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept {
 }
 
 GraphSlotStatus admit_graph_packet_for_restore(
-    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id, GraphRestoreView &out
+    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
+    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreView &out
 ) noexcept {
     const GraphSlotRegistry *registry = current_registry.load(std::memory_order_acquire);
     if (registry == nullptr) return GraphSlotStatus::NotReady;
@@ -139,6 +140,12 @@ GraphSlotStatus admit_graph_packet_for_restore(
     if (graph_windows_overlap(source, registration.registry)) return GraphSlotStatus::SourceOverlap;
     for (const auto &destination : registration.destinations)
         if (graph_windows_overlap(source, destination)) return GraphSlotStatus::SourceOverlap;
+    SimplerKernelInvocationHeader invocation{};
+    const auto admission = simpler::kernel::validate_invocation_header(
+        {static_cast<const uint8_t *>(packet), bytes}, trusted_callable, &invocation
+    );
+    if (admission == simpler::kernel::InvocationStatus::StaleCallable) return GraphSlotStatus::CallableMismatch;
+    if (admission != simpler::kernel::InvocationStatus::Ok) return GraphSlotStatus::InvalidPacket;
     if (validate_graph_packet(packet, bytes, GraphPacketAddress::DeviceCopy) != GraphPacketStatus::Ok)
         return GraphSlotStatus::InvalidPacket;
     GraphPacketHeader header{};
@@ -153,7 +160,7 @@ GraphSlotStatus admit_graph_packet_for_restore(
             header.destinations[i].capacity != registration.destinations[i].capacity)
             return GraphSlotStatus::BindingMismatch;
     out = {
-        registration, header,
+        invocation, registration, header,
         static_cast<const std::byte *>(packet) + sizeof(SimplerKernelInvocationHeader) + header.payload_offset
     };
     return GraphSlotStatus::Ok;

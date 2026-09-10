@@ -11,6 +11,7 @@
 #pragma once
 
 #include "host_build_graph/kernel_graph_slot_wire.h"
+#include "task_interface/kernel_invocation_validation.h"
 
 namespace hbg {
 
@@ -36,6 +37,7 @@ bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept;
 // Read-only admission result. The packet and registry stay immutable/alive while
 // the caller uses it. Image semantics, restoration and dispatch are separate.
 struct GraphRestoreView {
+    SimplerKernelInvocationHeader invocation{};
     GraphSlotRegistration slot{};
     GraphPacketHeader graph{};
     const std::byte *payload{nullptr};
@@ -43,9 +45,12 @@ struct GraphRestoreView {
 
 // Uses the independently latched registry, never an address supplied by packet.
 // Expected device/binary identity comes from trusted AICPU initialization, not packet fields.
+// trusted_callable is borrowed from the live callable registration owner, never
+// synthesized from packet fields. Its lease spans admission and consumption.
 // On failure: no slot write, generation publication, or output modification.
 GraphSlotStatus admit_graph_packet_for_restore(
-    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id, GraphRestoreView &out
+    const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
+    const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreView &out
 ) noexcept;
 
 }  // namespace hbg

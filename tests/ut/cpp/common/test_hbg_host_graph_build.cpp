@@ -1449,6 +1449,7 @@ TEST_F(HbgGraphPacketTest, RealBuildAcceptsWindowMinusOneAndRejectsFullWindow) {
 
 class HbgGraphSlotTest : public HbgGraphPacketTest {
 protected:
+    simpler::kernel::PreparedInvocationView trusted_callable{7, 1, 2, 31};
     hbg::GraphSlotRegistration seal{};
     hbg::GraphSlotRegistry *registry{nullptr};
     hbg::GraphHostArgs packet;
@@ -1498,7 +1499,7 @@ protected:
         h.checksum = hbg::graph_packet_checksum(packet.storage.data(), packet.bytes);
     }
     hbg::GraphSlotStatus admit(hbg::GraphRestoreView &view) {
-        return hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 109, view);
+        return hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 109, trusted_callable, view);
     }
     std::vector<std::byte> working_bytes() const {
         std::vector<std::byte> data;
@@ -1672,17 +1673,25 @@ TEST_F(HbgGraphSlotTest, RejectsSourceOverlapAndOversizedPacketsBeforeReadingPay
     for (const auto &destination : seal.destinations) {
         if (destination.capacity == 0) continue;
         EXPECT_EQ(
-            hbg::admit_graph_packet_for_restore(reinterpret_cast<const void *>(destination.address), 64, 0, 109, out),
+            hbg::admit_graph_packet_for_restore(
+                reinterpret_cast<const void *>(destination.address), 64, 0, 109, trusted_callable, out
+            ),
             hbg::GraphSlotStatus::SourceOverlap
         );
     }
-    EXPECT_EQ(hbg::admit_graph_packet_for_restore(registry, 64, 0, 109, out), hbg::GraphSlotStatus::SourceOverlap);
     EXPECT_EQ(
-        hbg::admit_graph_packet_for_restore(packet.storage.data(), seal.max_packet_bytes + 1, 0, 109, out),
+        hbg::admit_graph_packet_for_restore(registry, 64, 0, 109, trusted_callable, out),
+        hbg::GraphSlotStatus::SourceOverlap
+    );
+    EXPECT_EQ(
+        hbg::admit_graph_packet_for_restore(
+            packet.storage.data(), seal.max_packet_bytes + 1, 0, 109, trusted_callable, out
+        ),
         hbg::GraphSlotStatus::InvalidPacket
     );
     EXPECT_EQ(
-        hbg::admit_graph_packet_for_restore(packet.storage.data(), 1, 0, 109, out), hbg::GraphSlotStatus::InvalidPacket
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), 1, 0, 109, trusted_callable, out),
+        hbg::GraphSlotStatus::InvalidPacket
     );
     EXPECT_EQ(working_bytes(), before);
     EXPECT_EQ(out.payload, nullptr);
@@ -1787,6 +1796,8 @@ TEST_F(HbgGraphSlotTest, InvocationIdentityMayVaryWithoutChangingTheRegisteredSl
     auto *envelope = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data());
     ++envelope->callable_id;
     ++envelope->generation;
+    ++trusted_callable.callable_id;
+    ++trusted_callable.slot_generation;
     ++packet_header().callable_hash;
     ++packet_header().argument_hash;
     ++packet_header().function_hash;
@@ -1843,11 +1854,11 @@ TEST_F(HbgGraphSlotTest, RegistryAddressAndExpectedRuntimeIdentityComeFromContro
     EXPECT_FALSE(hbg::detach_graph_slot_registry(other));
     hbg::GraphRestoreView view;
     EXPECT_EQ(
-        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 1, 109, view),
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 1, 109, trusted_callable, view),
         hbg::GraphSlotStatus::DeviceMismatch
     );
     EXPECT_EQ(
-        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 110, view),
+        hbg::admit_graph_packet_for_restore(packet.storage.data(), packet.bytes, 0, 110, trusted_callable, view),
         hbg::GraphSlotStatus::BinaryMismatch
     );
     EXPECT_EQ(view.payload, nullptr);
@@ -1872,3 +1883,70 @@ TEST_F(HbgGraphSlotTest, RejectsCorruptRegistryHeaderAndRetainsOwnershipUntilDet
 }
 
 }  // namespace
+
+TEST_F(HbgGraphSlotTest, RejectsUnregisteredCallableGenerationBeforeAnyWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    auto *envelope = reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data());
+    ++envelope->generation;
+    patch();
+    const auto before = working_bytes();
+    hbg::GraphRestoreView output{};
+    EXPECT_NE(admit(output), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, RejectsCallableIdentityAndCountsDespiteValidChecksum) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet.storage;
+    using Mutate = void (*)(SimplerKernelInvocationHeader &);
+    const Mutate mutations[] = {
+        [](auto &h) {
+            ++h.callable_id;
+        },
+        [](auto &h) {
+            ++h.tensor_count;
+        },
+        [](auto &h) {
+            ++h.scalar_count;
+        },
+        [](auto &h) {
+            h.host_copy_tensor_count = 1;
+        },
+        [](auto &h) {
+            h.callable_id = MAX_REGISTERED_CALLABLE_IDS;
+        },
+        [](auto &h) {
+            h.tensor_count = CHIP_MAX_TENSOR_ARGS;
+            h.scalar_count = 1;
+        },
+        [](auto &h) {
+            h.abi_version++;
+        },
+        [](auto &h) {
+            h.reserved[1] = 1;
+        },
+    };
+    for (auto mutate : mutations) {
+        packet.storage = original;
+        mutate(*reinterpret_cast<SimplerKernelInvocationHeader *>(packet.storage.data()));
+        patch();
+        const auto before = working_bytes();
+        hbg::GraphRestoreView output{};
+        output.invocation.generation = 999;
+        EXPECT_NE(admit(output), hbg::GraphSlotStatus::Ok);
+        EXPECT_EQ(output.invocation.generation, 999u);
+        EXPECT_EQ(working_bytes(), before);
+    }
+}
+
+TEST_F(HbgGraphSlotTest, CallableAndContextGenerationsHaveIndependentAuthorities) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    hbg::GraphRestoreView output{};
+    ASSERT_EQ(admit(output), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(output.invocation.generation, 31u);
+    EXPECT_EQ(output.slot.slot_generation, 19u);
+    trusted_callable.slot_generation = 19;
+    expect_rejected(hbg::GraphSlotStatus::CallableMismatch);
+    trusted_callable.slot_generation = 0;
+    expect_rejected(hbg::GraphSlotStatus::InvalidPacket);
+}
