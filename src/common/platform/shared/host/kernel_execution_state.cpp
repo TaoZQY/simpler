@@ -96,6 +96,7 @@ int KernelExecutionState::mark_ready_enqueued() {
     if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    prepare_tail_pending_ = true;
     phase_ = KernelContextPhase::ReadyEnqueued;
     return 0;
 }

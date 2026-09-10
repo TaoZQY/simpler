@@ -66,6 +66,8 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_ctx_control.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_execution_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/kernel_launch_binder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/kernel_launch_native.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_device_resources.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/clock_correlation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"

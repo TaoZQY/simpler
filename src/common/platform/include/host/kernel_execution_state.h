@@ -81,6 +81,7 @@ struct KernelContextOps {
     int (*get_current_device)(void *context, int *device_id){nullptr};
     int (*create_stream)(void *context, KernelStreamKind kind, void **stream){nullptr};
     int (*destroy_stream)(void *context, KernelStreamKind kind, void *stream){nullptr};
+    // Native events require ACL_EVENT_SYNC; default events are not capture-safe.
     int (*create_event)(void *context, void **event){nullptr};
     int (*destroy_event)(void *context, void *event){nullptr};
 
@@ -131,13 +132,17 @@ enum class KernelEventKind : size_t {
     Count,
 };
 
+struct KernelInvocationBinding;
+struct KernelLaunchGateOps;
+struct KernelLaunchResult;
+
 /**
  * Context-lifetime state for the borrowed kernel execution mode.
  *
  * This object owns the dedicated AICPU stream, hidden AICore stream and event set; every
  * graph-visible persistent execution resource belongs here rather than in a
- * per-invocation object. The caller stream is never stored or destroyed —
- * each launch receives it as a borrowed argument.
+ * per-invocation object. Each launch borrows the caller stream;
+ * only its identity is retained for stream-switch admission, never ownership.
  *
  * Phase machine:
  *   New → (initialize) → Collecting ⇄ ReadyEnqueued
@@ -185,6 +190,8 @@ public:
     ) const;
     bool resources_prepared() const;
     bool resources_frozen() const;
+    // The owner has recorded PrepareTail after preparation before publication.
+    // Re-publication requires another record under the same external lease.
     int mark_ready_enqueued();
     void poison(int runtime_error);
     int close();
@@ -199,6 +206,10 @@ public:
     void *event(KernelEventKind kind) const;
 
 private:
+    friend KernelLaunchResult launch_bound_kernel(
+        KernelExecutionState &, const KernelInvocationBinding &, void *, const KernelLaunchGateOps &,
+        const KernelLaunchOps &
+    );
     int cleanup_owned_resources_locked();
     bool has_live_resources_locked() const;
 
@@ -206,6 +217,8 @@ private:
     KernelContextPhase phase_{KernelContextPhase::New};
     int device_id_{-1};
     uint64_t context_generation_{0};
+    uintptr_t last_caller_identity_{0};
+    bool prepare_tail_pending_{false};
     KernelDeviceResources resources_;
     int last_runtime_error_{0};
     int unexpected_teardown_error_{0};

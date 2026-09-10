@@ -17,6 +17,7 @@
 
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_graph_template.h"
+#include "host_build_graph/kernel_graph_binding.h"
 #include "host_build_graph/kernel_graph_slot.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/kernel_graph_restore.h"
@@ -1524,6 +1525,62 @@ protected:
         EXPECT_EQ(working_bytes(), before);
     }
 };
+
+TEST_F(HbgGraphSlotTest, BinderRequiresPreparedHostPacketAndMatchingSealedResources) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    KernelInvocationPlaceholder placeholder{packet.address_offset, packet.data_offset};
+    KernelInvocationBinding invocation;
+    invocation.device_id = 0;
+    invocation.context_generation = 19;
+    invocation.packet = {reinterpret_cast<const uint8_t *>(packet.storage.data()), packet.bytes};
+    invocation.callable = trusted_callable;
+    invocation.placeholders = &placeholder;
+    invocation.placeholder_count = 1;
+    KernelResourceView regions[5];
+    for (size_t i = 0; i < 5; ++i) {
+        const auto &region = i == 4 ? seal.registry : seal.destinations[i];
+        regions[i] = {region.address, region.capacity};
+    }
+    KernelResourceBinding resources{regions, 5};
+    hbg::GraphKernelBinding graph{packet, seal};
+    const auto before = working_bytes();
+    const int allocations = provider.allocation_calls;
+    EXPECT_EQ(hbg::GraphKernelBinding::validate(&graph, invocation, resources), 0);
+    for (int fault = 0; fault < 6; ++fault) {
+        SCOPED_TRACE(fault);
+        auto bad_invocation = invocation;
+        auto bad_seal = seal;
+        auto bad_placeholder = placeholder;
+        bad_invocation.placeholders = &bad_placeholder;
+        switch (fault) {
+        case 0:
+            ++bad_invocation.context_generation;
+            break;
+        case 1:
+            --bad_invocation.packet.size;
+            break;
+        case 2:
+            ++bad_placeholder.data_offset;
+            break;
+        case 3:
+            ++bad_seal.runtime_binary_id;
+            break;
+        case 4:
+            bad_seal.destinations[0].address += 64;
+            break;
+        case 5:
+            ++bad_seal.max_packet_bytes;
+            break;
+        }
+        hbg::GraphKernelBinding bad_graph{packet, bad_seal};
+        EXPECT_NE(hbg::GraphKernelBinding::validate(&bad_graph, bad_invocation, resources), 0);
+    }
+    patch();
+    EXPECT_NE(hbg::GraphKernelBinding::validate(&graph, invocation, resources), 0);
+    EXPECT_EQ(working_bytes(), before);
+    EXPECT_EQ(provider.allocation_calls, allocations);
+}
 
 TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStream) {
     ASSERT_GE(build(chain_entry), 0);

@@ -253,8 +253,10 @@ a synchronous HostArgs consumer; only task execution is asynchronous.
 function, block count and config, with exactly one `aclrtPlaceHolderInfo`.
 Enqueue errors are returned unchanged to the enclosing launch protocol.
 
-The adapter assumes the enclosing protocol has established entry/exit events
-and retained the function/context leases. It does not create streams, record
+The template adapter assumes the enclosing protocol has established entry/exit
+events and retained the function/context leases. The
+[kernel launch binder](kernel-launch-binder.md) consumes prebuilt HostArgs and
+implements the three-stream protocol with failure compensation. It does not create streams, record
 or wait events, implement partial-enqueue recovery, or enable public K1 launch.
 The A5 scheduler region is restored from its zeroed template. The common
 scheduler queues, mailbox and runtime pointers are rebuilt by the leader restore;

@@ -550,6 +550,23 @@ target_link_libraries(test_kernel_execution_state PRIVATE ${GTEST_MAIN_LIB} ${GT
 add_test(NAME test_kernel_execution_state COMMAND test_kernel_execution_state)
 set_tests_properties(test_kernel_execution_state PROPERTIES LABELS "no_hardware")
 
+add_executable(test_kernel_launch_binder
+    common/test_kernel_launch_binder.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host/kernel_launch_binder.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_execution_state.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/kernel_device_resources.cpp
+)
+target_include_directories(test_kernel_launch_binder PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/host
+    ${GTEST_INCLUDE_DIRS}
+)
+target_link_libraries(test_kernel_launch_binder PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_launch_binder COMMAND test_kernel_launch_binder)
+set_tests_properties(test_kernel_launch_binder PROPERTIES LABELS "no_hardware")
+
 # Runtime extension payloads are per-run state even though the collector's
 # shared-memory resources remain resident across runs.
 add_executable(test_chip_swimlane_collector
@@ -1562,6 +1579,26 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
             ${ASCEND_HOME_PATH}/runtime/lib64
             ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
         NO_DEFAULT_PATH REQUIRED)
+
+    # Uses SDK declarations but fake ACL symbols; execution needs no device.
+    add_executable(test_kernel_launch_native
+        common/test_kernel_launch_native.cpp
+        ${PROJECT_ROOT}/src/common/platform/onboard/host/kernel_launch_native.cpp
+        ${PROJECT_ROOT}/src/common/platform/onboard/host/kernel_launch_binder.cpp
+        ${PROJECT_ROOT}/src/common/platform/shared/host/kernel_execution_state.cpp
+        ${PROJECT_ROOT}/src/common/platform/shared/host/kernel_device_resources.cpp
+    )
+    target_include_directories(test_kernel_launch_native PRIVATE
+        ${PROJECT_ROOT}/src/common
+        ${PROJECT_ROOT}/src/common/task_interface
+        ${PROJECT_ROOT}/src/common/platform/include
+        ${PROJECT_ROOT}/src/common/platform/onboard/host
+        ${ASCEND_HOME_PATH}/include
+        ${GTEST_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_kernel_launch_native PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+    add_test(NAME test_kernel_launch_native COMMAND test_kernel_launch_native)
+    set_tests_properties(test_kernel_launch_native PROPERTIES LABELS "no_hardware")
 
     # Black-box lifecycle UT for the comm_* C API on Path D. See the file
     # header for the contract it pins down.
