@@ -81,10 +81,10 @@ int bind_definition_images(
     const GraphBuild &build, std::byte *sm, uint64_t definition_base,
     const std::unordered_map<uint64_t, DefinitionImage> &images, uint64_t ready_capacity
 ) {
-    const auto source_offsets = sm_layout::segment_offsets(build.task_capacity);
-    const auto target_offsets = sm_layout::segment_offsets(sm_layout::image_extents(build.usage));
+    const auto source_offsets = sm_layout::segment_offsets(build.workspace.task_capacity);
+    const auto target_offsets = sm_layout::segment_offsets(sm_layout::image_extents(build.bind_usage));
     const auto *source_storage = reinterpret_cast<const ChipTaskStorage *>(
-        static_cast<const std::byte *>(build.host_sm) + source_offsets.storage
+        static_cast<const std::byte *>(build.workspace.sm_mirror) + source_offsets.storage
     );
     auto *target_storage = reinterpret_cast<ChipTaskStorage *>(sm + target_offsets.storage);
     ReadyQueuePopulations populations = build.ready_queue_populations;
@@ -169,7 +169,7 @@ int make_graph_launch_template(
     uint64_t slot_generation, uint64_t runtime_binary_id, const GraphInvocationIdentity &identity,
     GraphLaunchTemplate &out
 ) try {
-    if (!build.ready || !build.graph_state || build.host_sm == nullptr || build.total_tasks < 0)
+    if (!build.build_complete || !build.graph_state || build.workspace.sm_mirror == nullptr || build.total_tasks < 0)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (identity.callable_id < 0 || identity.tensor_count < 0 || identity.scalar_count < 0 ||
         identity.tensor_count > CHIP_MAX_TENSOR_ARGS || identity.scalar_count > CHIP_MAX_SCALAR_ARGS ||
@@ -177,14 +177,14 @@ int make_graph_launch_template(
         runtime_binary_id == 0)
         return PTO_RUNTIME_ERR_INTERNAL;
     RuntimeArenaLayout layout{};
-    int rc = make_kernel_graph_layout(build.task_capacity, layout);
+    int rc = make_kernel_graph_layout(build.workspace.task_capacity, layout);
     if (rc != 0) return rc;
-    const auto mirror = sm_layout::mirror_extents(build.task_capacity);
-    if (static_cast<uint64_t>(build.total_tasks) >= build.task_capacity ||
-        build.usage.submitted_tasks != static_cast<uint64_t>(build.total_tasks) ||
-        build.usage.fanin_elems > mirror.fanin_elems || build.usage.tensor_elems > mirror.tensor_elems ||
-        build.usage.scalar_elems > mirror.scalar_elems ||
-        build.image_bytes != sm_layout::segment_offsets(sm_layout::image_extents(build.usage)).end)
+    const auto mirror = sm_layout::mirror_extents(build.workspace.task_capacity);
+    if (static_cast<uint64_t>(build.total_tasks) >= build.workspace.task_capacity ||
+        build.bind_usage.submitted_tasks != static_cast<uint64_t>(build.total_tasks) ||
+        build.bind_usage.fanin_elems > mirror.fanin_elems || build.bind_usage.tensor_elems > mirror.tensor_elems ||
+        build.bind_usage.scalar_elems > mirror.scalar_elems ||
+        build.image_bytes != sm_layout::segment_offsets(sm_layout::image_extents(build.bind_usage)).end)
         return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
     GraphResourceRequirements required{};
     rc = get_graph_resource_requirements(build, layout, required);
@@ -206,7 +206,7 @@ int make_graph_launch_template(
     header.function_hash = identity.function_hash;
     header.runtime_offset = layout.off_runtime;
     header.sm_offset = layout.off_copied_end;
-    header.task_window = build.task_capacity;
+    header.task_window = build.workspace.task_capacity;
     header.total_tasks = build.total_tasks;
     header.destinations[0] = {binding.heap.address, binding.heap.capacity};
     header.destinations[1] = {binding.runtime_image.address, binding.runtime_image.capacity};
@@ -241,7 +241,7 @@ int make_graph_launch_template(
     pristine.prebuilt_layout = layout;
     std::memcpy(image + layout.off_runtime, &pristine, sizeof(pristine));
     sm_layout::compact_live_image(
-        static_cast<const char *>(build.host_sm), build.task_capacity, build.usage,
+        static_cast<const char *>(build.workspace.sm_mirror), build.workspace.task_capacity, build.bind_usage,
         {binding.heap.address, build.heap_bytes}, reinterpret_cast<char *>(image + layout.off_copied_end)
     );
     reinterpret_cast<SharedMemoryHeader *>(image + layout.off_copied_end)->tasks.total_tasks = build.total_tasks;

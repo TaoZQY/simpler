@@ -66,7 +66,7 @@ private:
 };
 
 // Source build/context must share a live exclusive workspace lease. Resources
-// were prepared using make_kernel_graph_layout(build.task_capacity) and frozen.
+// were prepared using make_kernel_graph_layout(build.workspace.task_capacity) and frozen.
 // All destination accesses here are address arithmetic, never device memory IO.
 int make_graph_launch_template(
     const GraphBuild &build, const RuntimeContext &runtime, const KernelExecutionState &context, int device_id,

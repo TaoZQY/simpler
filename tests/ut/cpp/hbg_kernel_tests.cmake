@@ -26,6 +26,7 @@ foreach(arch IN ITEMS a2a3 a5)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/memory_allocator.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/${arch}/runtime/host_build_graph/host/runtime_maker.cpp
         ${HBG_SHARED_RUNTIME_SOURCES}
+        ${HBG_HOST_DIR}/graph_definition_pack.cpp
         ${HBG_HOST_DIR}/orchestrator.cpp
         ${HBG_HOST_DIR}/runtime_core.cpp
         ${HBG_HOST_DIR}/host_tensor_access.cpp

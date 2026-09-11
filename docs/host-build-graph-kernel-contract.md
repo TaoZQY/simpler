@@ -20,7 +20,7 @@ while the first result is still being consumed. Build and upload require
 exclusive workspace access. Concurrent read-only queries may share a completed
 build, but must not overlap build or upload.
 
-`hbg::upload_program_graph` is the explicit program-only allocation and
+`hbg::upload_for_program_mode` is the explicit program-only allocation and
 synchronous H2D boundary. It creates a compact image from the virtual-address
 source on each upload. If Definition staging grows and moves, the upload owner
 preserves its contents and rebinds the build's staging reference before further
@@ -40,9 +40,10 @@ After a successful build, call
 `hbg::get_graph_resource_requirements(build, layout, requirements)` with the
 layout of the intended destination for the same task window and runtime ABI.
 Program mode uses its existing layout; kernel mode uses
-`make_kernel_graph_layout(build.task_capacity, layout)`. The query does no device
-allocation, address binding or H2D. It enumerates Host Definition records, so
-resource discovery runs outside capture.
+`make_kernel_graph_layout(build.workspace.task_capacity, layout)`. The query does no device
+allocation, address binding or H2D. H1 has already validated and measured the
+Definition plan, so the query reads the immutable measurement and does not scan
+or mutate the borrowed Definition staging.
 
 `GraphResourceRequirements` is an independent value snapshot for one graph:
 

@@ -64,6 +64,7 @@
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_graph_build.h"
+#include "host_build_graph/graph_definition_pack.h"
 #include "host_build_graph/host_phase_trace.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/ready_queue_sizing.h"
@@ -733,176 +734,6 @@ using hbg::HostOrchEntryPoints;
 // an index from its own block. The bytes the host wrote are therefore the bytes
 // the device schedules, with no on-device or pre-copy pointer fixup.
 
-// What the Definition pass copied to the device: the distinct objects, the bytes
-// of the one block holding them (inter-object alignment padding included), and how
-// many of them the recorders could not build in the block, so that this pass had to
-// copy them in. The object count is smaller than the run's Graph task count, which exceeds it
-// by the replay factor — one Definition serves every task with its key.
-struct DefinitionUploads {
-    size_t count;
-    uint64_t bytes;
-    size_t spilled;
-};
-
-// Ship the run's Definition objects and bind every outer Graph task to the one
-// with its key. The recorders built most or all of them in place in the block's
-// host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
-// claimed, so this pass writes the headers, copies in whatever did not fit, and
-// issues a single H2D of the used prefix. The device initial classify then replaces
-// each task's graph_context with an execution constructed in its own heap.
-bool bind_graph_definitions(
-    const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    ReadyQueuePopulations *ready_queue_populations
-) {
-    *uploads = DefinitionUploads{};
-    const size_t count = graph_host_upload_count(graph_state);
-    GraphHostDefinitionList definitions = graph_host_definitions(graph_state);
-    const auto align_up = [](size_t value) {
-        return (value + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
-    };
-    struct PackedDefinition {
-        size_t object_offset;   // of the object's header, from the block base
-        size_t image_bytes;     // the Definition image alone
-        const std::byte *copy;  // the image to copy in, or nullptr when built in place
-        ReadyQueuePopulations ready_queue_populations;
-        bool populations_ready{false};
-    };
-    std::unordered_map<uint64_t, PackedDefinition> packed;
-    // Objects the recorders built already occupy the arena's used prefix at the
-    // offsets they claimed, so the block starts out that long and the rest are
-    // appended past them.
-    size_t block_bytes = graph_host_arena_used(graph_state);
-    for (const GraphHostDefinition &entry : definitions.entries) {
-        if (entry.bytes < sizeof(GraphDefinition)) continue;
-        if (entry.spill == nullptr) {
-            packed.emplace(entry.full_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
-            continue;
-        }
-        const size_t object_offset = block_bytes;
-        block_bytes += align_up(sizeof(GraphDefinitionHeader) + entry.bytes);
-        packed.emplace(entry.full_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
-        uploads->spilled++;
-    }
-
-    void *block = nullptr;
-    std::byte *staging = nullptr;
-    if (block_bytes != 0) {
-        void *staging_addr = nullptr;
-        // Growing the staging preserves what the recorders wrote into it, and the
-        // offsets above name positions rather than addresses, so a block that moves
-        // here costs nothing. Nothing is recording by now, which is what makes the
-        // move safe at all.
-        if (api->acquire_graph_definition_block(block_bytes, GRAPH_DEFINITION_OBJECT_ALIGN, &block, &staging_addr) !=
-            0) {
-            LOG_ERROR(
-                "host-orch: failed to retain %zu bytes for %zu Graph Definition object(s)", block_bytes, packed.size()
-            );
-            return false;
-        }
-        staging = static_cast<std::byte *>(staging_addr);
-        // The owner may have moved staging. Publish its new base even if a
-        // later copy fails, so retry and repeated upload retain a valid source.
-        if (!graph_host_rebind_staging(graph_state, staging, block_bytes)) return false;
-        for (const auto &[key, object] : packed) {
-            std::byte *base = staging + object.object_offset;
-            std::byte *image = base + sizeof(GraphDefinitionHeader);
-            if (object.copy != nullptr) std::memcpy(image, object.copy, object.image_bytes);
-            // Built value-initialized and copied over the whole header, so every byte
-            // of the object's framing — padding included — is defined by this write
-            // rather than by what the retained staging held before it.
-            const auto *definition = reinterpret_cast<const GraphDefinition *>(image);
-            GraphDefinitionHeader framing{};
-            framing.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
-            framing.full_key = definition->full_key;
-            framing.definition_bytes = definition->total_bytes;
-            std::memcpy(base, &framing, sizeof(framing));
-            const size_t object_bytes = sizeof(GraphDefinitionHeader) + object.image_bytes;
-            const size_t padded = align_up(object_bytes);
-            std::memset(base + object_bytes, 0, padded - object_bytes);
-        }
-        if (api->copy_to_device(block, staging, block_bytes) != 0) {
-            LOG_ERROR("host-orch: failed to upload the Graph Definition block");
-            return false;
-        }
-        uploads->count = packed.size();
-        uploads->bytes = block_bytes;
-    }
-
-    for (size_t index = 0; index < count; ++index) {
-        std::optional<GraphHostUpload> upload = graph_host_upload(graph_state, index);
-        if (!upload.has_value() || upload->outer_slot == nullptr || upload->outer_slot->task_kind != TaskKind::GRAPH) {
-            LOG_ERROR("host-orch: invalid pending Graph task");
-            return false;
-        }
-        auto object_it = packed.find(upload->full_key);
-        if (object_it == packed.end() || block == nullptr || staging == nullptr) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
-            return false;
-        }
-        // The object as it was shipped, so what this validates is the bytes the
-        // device will read rather than a host copy of them.
-        const auto *definition = reinterpret_cast<const GraphDefinition *>(
-            staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
-        );
-        if (definition->total_bytes != object_it->second.image_bytes) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
-            return false;
-        }
-        GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count <= 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
-            definition->full_key != upload->full_key ||
-            !graph_execution_storage_layout(
-                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
-            ) ||
-            storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != definition->boundary_count ||
-            upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
-            LOG_ERROR("host-orch: invalid Graph Definition for task");
-            return false;
-        }
-        const uintptr_t outer_base =
-            reinterpret_cast<uintptr_t>(upload->outer_slot->to_descriptor().packed_buffer_base);
-        const uintptr_t outer_end = reinterpret_cast<uintptr_t>(upload->outer_slot->to_descriptor().packed_buffer_end);
-        if (outer_end < outer_base || definition->required_heap > UINTPTR_MAX - outer_base ||
-            storage_layout.total_bytes > outer_end - outer_base ||
-            definition->required_heap > outer_end - outer_base - storage_layout.total_bytes) {
-            LOG_ERROR("host-orch: Graph runtime storage does not fit its outer task heap");
-            return false;
-        }
-        const uintptr_t storage_addr = outer_base + definition->required_heap;
-        if (storage_addr % alignof(ChipTaskStorage) != 0) {
-            LOG_ERROR("host-orch: Graph runtime storage address is misaligned");
-            return false;
-        }
-        PackedDefinition &packed_definition = object_it->second;
-        if (!packed_definition.populations_ready) {
-            const InGraphTaskDefinition *tasks = graph_definition_array<InGraphTaskDefinition>(
-                *definition, definition->off_in_graph_tasks, definition->task_count
-            );
-            if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition in-graph task array");
-                return false;
-            }
-            for (int32_t i = 0; i < definition->task_count; ++i) {
-                // Sizing takes the kind materialize will give this task. add_task
-                // singles out GRAPH and routes everything else by shape, and a Graph
-                // body member is never the shell, so the shape decides. Derived here
-                // the same way the device derives it, so the two cannot drift.
-                const ActiveMask mask(tasks[i].active_mask);
-                packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL
-                );
-            }
-            packed_definition.populations_ready = true;
-        }
-        ready_queue_populations->add(packed_definition.ready_queue_populations);
-        upload->outer_slot->graph_context = reinterpret_cast<GraphDefinition *>(
-            reinterpret_cast<uintptr_t>(block) + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
-        );
-    }
-    return true;
-}
-
 struct GraphHostStateBinding {
     explicit GraphHostStateBinding(OrchestratorState &orchestrator, GraphHostState *state) :
         orchestrator(orchestrator) {
@@ -1259,11 +1090,28 @@ bool create_scheduler_state(
 }  // namespace
 
 int32_t hbg::build_graph(
-    Runtime *runtime, HostTensorAccessor &tensor_access, RuntimeContext *rt, void *host_sm, uint64_t sm_size,
-    uint64_t task_capacity, const GraphDefinitionArena &definition_arena, const HostOrchEntryPoints &entry_points,
-    const ChipTaskArgs &args, GraphBuild &build
+    Runtime *runtime, HostTensorAccessor &tensor_access, LeasedWorkspace workspace,
+    const HostOrchEntryPoints &entry_points, const ChipTaskArgs &args, GraphBuild &build
 ) {
-    build.ready = false;
+    build.build_complete = false;
+    build.definitions.reset();
+    build.workspace = {};
+    build.total_tasks = 0;
+    build.ready_queue_populations = {};
+    build.ready_queue_capacities = {};
+    build.bind_usage = {};
+    build.image_bytes = 0;
+    build.heap_bytes = 0;
+    build.definition_bytes = 0;
+    RuntimeContext *rt = workspace.runtime_context;
+    void *host_sm = workspace.sm_mirror;
+    const uint64_t sm_size = workspace.sm_bytes;
+    const uint64_t task_capacity = workspace.task_capacity;
+    const auto &definition_arena = workspace.definitions;
+    if (!runtime || !rt || !host_sm || !entry_points.entry || !entry_points.bind || task_capacity == 0 ||
+        task_capacity > INT32_MAX || sm_size < SharedMemoryHandle::calculate_size(task_capacity) ||
+        reinterpret_cast<uintptr_t>(host_sm) % CHIP_ALIGN_SIZE != 0)
+        return PTO_RUNTIME_ERR_INTERNAL;
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
 
@@ -1282,7 +1130,7 @@ int32_t hbg::build_graph(
         rt->orchestrator = nullptr;
     });
     // The graph heap is allocated out of the HEAP_VIRTUAL_BASE window: its device
-    // region is committed by upload_program_graph at the measured size. compact_live_image
+    // region is committed by upload_for_program_mode at the measured size. compact_live_image
     // moves every address the orchestrator wrote onto the real base before upload.
     if (!orchestrator.init(
             host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
@@ -1292,7 +1140,7 @@ int32_t hbg::build_graph(
     }
 
     // Initialize the host SM header (ring flow control) so submit_task can run.
-    SharedMemoryHandle &host_sm_handle = build.sm_handle;
+    SharedMemoryHandle &host_sm_handle = build.host_sm_handle;
     if (!host_sm_handle.init(host_sm, sm_size, task_capacity)) {
         LOG_ERROR("host-orch: host SM init failed");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1325,10 +1173,6 @@ int32_t hbg::build_graph(
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
 
-    if (entry_points.bind == nullptr) {
-        LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
     rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points.entry);
     rt->tensor_access = &tensor_access;
     // Binds the orchestration .so's own framework_current_runtime, which its
@@ -1406,6 +1250,26 @@ int32_t hbg::build_graph(
         ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
     }
 
+    auto definitions = std::make_unique<GraphDefinitionPlan>();
+    if (!pack_graph_definitions(*graph_state, definition_arena, *definitions, ready_queue_populations))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    ReadyQueueCapacities ready_queue_capacities{};
+    const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
+    if (ready_queue_status != 0) {
+        LOG_ERROR(
+            "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph=%" PRIu64 "/%" PRIu64 ")",
+            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
+            ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
+            ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
+            ready_queue_populations.graph_ready, ready_queue_populations.graph_prepare
+        );
+        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
+        return ready_queue_status;
+    }
+    build.ready_queue_capacities = ready_queue_capacities;
+    build.definition_bytes = definitions->bytes;
+    build.definitions = std::move(definitions);
     const uint64_t nt = static_cast<uint64_t>(total_tasks);
     // What this bind actually put in the pools. The orchestrator's cursors are the
     // exact populated extent of each one — no scan of the mirror is needed, and the
@@ -1422,38 +1286,34 @@ int32_t hbg::build_graph(
         std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
         DeviceArena::kDefaultBaseAlign
     );
-    build.host_sm = host_sm;
-    build.task_capacity = task_capacity;
+    build.workspace = workspace;
     build.total_tasks = total_tasks;
     build.ready_queue_populations = ready_queue_populations;
-    build.usage = bind_usage;
+    build.bind_usage = bind_usage;
     build.image_bytes = image_bytes;
     build.heap_bytes = heap_bytes;
-    build.ready = true;
+    host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
+    build.build_complete = true;
     return total_tasks;
 }
 
 int32_t hbg::get_graph_resource_requirements(
     const GraphBuild &build, const RuntimeArenaLayout &layout, GraphResourceRequirements &requirements
 ) {
-    if (!build.ready || !build.graph_state || build.total_tasks < 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!build.build_complete || !build.graph_state || build.total_tasks < 0) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     if (layout.off_copied_begin > layout.off_copied_end || build.heap_bytes == 0 || build.image_bytes == 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
+
     GraphResourceRequirements next{};
     next.gm_heap_bytes = build.heap_bytes;
     next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
-    if (!graph_definition_block_bytes(
-            graph_host_definitions(*build.graph_state), graph_host_arena_used(*build.graph_state),
-            next.graph_definition_bytes
-        )) {
-        return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
-    }
+    next.graph_definition_bytes = build.definition_bytes;
     if (graph_host_upload_count(*build.graph_state) == 0) {
         static_assert(SCHEDULER_STATE_ALIGNMENT <= DeviceArena::kDefaultBaseAlign);
-        // The resident layout sizes arrays by total task count. Supplying the
-        // maximum per-core-type counts also bounds any non-Graph fallback.
         AicoreSchedulerLayout scheduler_layout{};
         const uint64_t tasks = static_cast<uint64_t>(build.total_tasks);
         if (!scheduler_plan_layout(tasks, tasks, tasks, &scheduler_layout) ||
@@ -1468,22 +1328,22 @@ int32_t hbg::get_graph_resource_requirements(
     return 0;
 }
 
-int32_t hbg::upload_program_graph(
+int32_t hbg::upload_for_program_mode(
     Runtime *runtime, const HostApi *api, RuntimeContext *rt, DeviceArena &host_arena, const RuntimeArenaLayout &layout,
     GraphBuild &build
 ) {
-    if (!build.ready) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!build.build_complete || rt != build.workspace.runtime_context) return PTO_RUNTIME_ERR_INVALID_STATE;
     GraphHostStatePtr &graph_state = build.graph_state;
-    void *host_sm = build.host_sm;
-    const uint64_t task_capacity = build.task_capacity;
+    void *host_sm = build.workspace.sm_mirror;
+    const uint64_t task_capacity = build.workspace.task_capacity;
     const int32_t total_tasks = build.total_tasks;
-    ReadyQueuePopulations ready_queue_populations = build.ready_queue_populations;
+    const ReadyQueueCapacities &ready_queue_capacities = build.ready_queue_capacities;
     // Upload each distinct Definition as its own retained device object and bind
     // every outer Graph task to it. Per-invocation data already lives in that
     // task's payload regions and is copied with the shared-memory image below.
     const BindPhaseMark graph_phase = bind_phase_begin();
-    DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    const auto &definitions = *build.definitions;
+    if (!upload_graph_definitions(api, build)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
@@ -1495,28 +1355,13 @@ int32_t hbg::upload_program_graph(
         // `copied=`, which on arena_h2d means a zone rather than a count.
         char attrs[kBindAttrsCapacity];
         snprintf(
-            attrs, sizeof(attrs), "defs=%zu bytes=%" PRIu64 " submissions=%zu spilled=%zu", definition_uploads.count,
-            definition_uploads.bytes, graph_host_upload_count(*graph_state), definition_uploads.spilled
+            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", definitions.objects.size(),
+            definitions.bytes, graph_host_upload_count(*graph_state), definitions.spilled
         );
-        record_bind_phase(HostPhaseKind::BindGraphUpload, graph_phase, attrs, definition_uploads.bytes);
+        record_bind_phase(HostPhaseKind::BindGraphUpload, graph_phase, attrs, definitions.bytes);
     }
 
-    ReadyQueueCapacities ready_queue_capacities{};
-    const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
-    if (ready_queue_status != 0) {
-        LOG_ERROR(
-            "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph=%" PRIu64 "/%" PRIu64 ")",
-            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
-            ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
-            ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
-            ready_queue_populations.graph_ready, ready_queue_populations.graph_prepare
-        );
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
-        return ready_queue_status;
-    }
     rt->prebuilt_layout.sched.capacities = ready_queue_capacities;
-    host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
     // The count travels inside the header the restack copies wholesale, which is
     // what lets the device bound its slot walks without a second
@@ -1535,7 +1380,7 @@ int32_t hbg::upload_program_graph(
     // with the same pitch, which is sound because a task id is its own slot index:
     // every id is below total_tasks and indexes the image directly.
     const uint64_t nt = static_cast<uint64_t>(total_tasks);
-    const sm_layout::BindUsage &bind_usage = build.usage;
+    const sm_layout::BindUsage &bind_usage = build.bind_usage;
     const uint64_t image_bytes = build.image_bytes;
     runtime->sm_image_bytes = image_bytes;
 
@@ -1601,7 +1446,7 @@ int32_t hbg::upload_program_graph(
     always_assert(
         reinterpret_cast<uint64_t>(gm_heap) < HEAP_VIRTUAL_BASE && "device memory reaches into the virtual heap window"
     );
-    // The alignment bind_graph_definitions checked on the virtual base — a Graph
+    // The alignment pack_graph_definitions checked on the virtual base — a Graph
     // task's runtime storage must land on alignof(ChipTaskStorage) — carries to
     // the real base only while the two are congruent: both are aligned to
     // kDefaultBaseAlign, and that covers the storage's own requirement.
@@ -1629,11 +1474,7 @@ int32_t hbg::upload_program_graph(
         ~static_cast<uintptr_t>(CHIP_ALIGN_SIZE - 1)
     );
 
-    // The copied zone carries no host address: the orchestrator and the ops table are
-    // both host-only, and no device code may reach host memory through the image.
-    // Their work is done, so the pointers go early rather than at the guard's scope
-    // exit.
-    rt->orchestrator = nullptr;
+    // The build guard clears orchestrator; the copied image also excludes Host ops.
     rt->ops = nullptr;
     std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
     const uint64_t compacted = sm_layout::compact_live_image(
@@ -1642,7 +1483,7 @@ int32_t hbg::upload_program_graph(
     always_assert(compacted == image_bytes);
 
     const sm_layout::SegmentOffsets device_segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
-    if (!create_scheduler_state(runtime, api, build.sm_handle, total_tasks, task_capacity, device_segments)) {
+    if (!create_scheduler_state(runtime, api, build.host_sm_handle, total_tasks, task_capacity, device_segments)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -1708,10 +1549,10 @@ int32_t run_host_orchestration(
     hbg::GraphBuild build;
     const auto &entry_points = *static_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
     const int32_t status = hbg::build_graph(
-        runtime, tensor_access, rt, host_sm, sm_size, task_capacity, definition_arena, entry_points, orch_l2, build
+        runtime, tensor_access, {rt, host_sm, sm_size, task_capacity, definition_arena}, entry_points, orch_l2, build
     );
     if (status < 0) return status;
-    return hbg::upload_program_graph(runtime, api, rt, host_arena, layout, build);
+    return hbg::upload_for_program_mode(runtime, api, rt, host_arena, layout, build);
 }
 
 }  // namespace

@@ -156,6 +156,45 @@ void two_definitions_entry(const ChipTaskArgs &args) {
     ASSERT_TRUE(orch.graph_end());
 }
 
+void large_graph_entry(bool overflow) {
+    auto &orch = *bound_runtime->orchestrator;
+    const uint32_t shape[] = {16};
+    auto boundary = simpler::hbg::make_tensor_external(reinterpret_cast<uint32_t *>(0x2000), shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    const auto scope = orch.graph_begin(0x91, args, bound_runtime->active_callable_hash);
+    ASSERT_TRUE(scope.recording);
+    ASSERT_TRUE(orch.graph_prepare(scope.recording_handle, args));
+    for (int i = 0; i < MAX_IN_GRAPH_TASKS; ++i) {
+        CoreTaskArgs task;
+        task.add_input(boundary);
+        ASSERT_TRUE(bound_runtime->ops->submit_dummy_task(bound_runtime, task).task_id().is_valid());
+    }
+    ASSERT_TRUE(orch.graph_end());
+    for (uint64_t i = 1; i < READY_QUEUE_CAPACITY_LIMIT / MAX_IN_GRAPH_TASKS; ++i) {
+        const auto replay = orch.graph_begin(0x91, args, bound_runtime->active_callable_hash);
+        ASSERT_FALSE(replay.execute_block);
+        ASSERT_TRUE(replay.task_id.is_valid());
+    }
+    if (overflow) {
+        CoreTaskArgs task;
+        task.add_input(boundary);
+        ASSERT_TRUE(bound_runtime->ops->submit_dummy_task(bound_runtime, task).task_id().is_valid());
+    }
+}
+
+void overflowing_graph_entry(const ChipTaskArgs &) { large_graph_entry(true); }
+void queue_limit_entry(const ChipTaskArgs &) { large_graph_entry(false); }
+
+void malformed_graph_entry(const ChipTaskArgs &args) {
+    graph_entry(args);
+    auto definitions = graph_host_definitions(*bound_runtime->orchestrator->graph_host_state);
+    ASSERT_EQ(definitions.entries.size(), 1u);
+    ASSERT_NE(definitions.entries[0].spill, nullptr);
+    auto *definition = reinterpret_cast<GraphDefinition *>(const_cast<std::byte *>(definitions.entries[0].spill));
+    definition->off_in_graph_tasks = UINT32_MAX;
+}
+
 void fatal_entry(const ChipTaskArgs &) {
     bound_runtime->orchestrator->report_fatal(SIMPLER_ERROR_INVALID_ARGS, "entry", "%s", "test build failure");
 }
@@ -197,11 +236,11 @@ protected:
     }
     int32_t build(void (*entry)(const ChipTaskArgs &)) {
         return hbg::build_graph(
-            &runtime, tensor_access, rt, mirror.data(), mirror.size(), capacity, definition_arena, {entry, bind},
+            &runtime, tensor_access, {rt, mirror.data(), mirror.size(), capacity, definition_arena}, {entry, bind},
             ChipTaskArgs{}, result
         );
     }
-    int32_t upload() { return hbg::upload_program_graph(&runtime, &api, rt, host_arena, layout, result); }
+    int32_t upload() { return hbg::upload_for_program_mode(&runtime, &api, rt, host_arena, layout, result); }
 
     void build_mixed_definitions() {
         ASSERT_GE(build(graph_entry), 0);
@@ -227,8 +266,8 @@ protected:
 
 TEST_F(HostGraphBuildTest, BuildReturnsWithoutDeviceAllocationOrUpload) {
     ASSERT_EQ(build(chain_entry), 2);
-    EXPECT_TRUE(result.ready);
-    EXPECT_EQ(result.usage.submitted_tasks, 2u);
+    EXPECT_TRUE(result.build_complete);
+    EXPECT_EQ(result.bind_usage.submitted_tasks, 2u);
     EXPECT_GT(result.heap_bytes, 0u);
     EXPECT_LT(result.image_bytes, mirror.size());
     EXPECT_EQ(platform.commits, 0);
@@ -254,7 +293,7 @@ TEST_F(HostGraphBuildTest, RepeatedUploadPreservesImageAndVirtualHeapSource) {
     EXPECT_EQ(source[0].payload.tensor_data()[0].buffer.addr, virtual_output);
     platform.heap_base += DeviceArena::kDefaultBaseAlign;
     ASSERT_EQ(upload(), 2);
-    const auto compact = sm_layout::segment_offsets(sm_layout::image_extents(result.usage));
+    const auto compact = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
     auto *uploaded =
         reinterpret_cast<ChipTaskStorage *>(static_cast<std::byte *>(runtime.get_gm_sm_ptr()) + compact.storage);
     EXPECT_EQ(
@@ -273,7 +312,7 @@ TEST_F(HostGraphBuildTest, EmptyBuildStillUploadsAValidHeader) {
 
 TEST_F(HostGraphBuildTest, FailedBuildCannotBeUploaded) {
     EXPECT_LT(build(fatal_entry), 0);
-    EXPECT_FALSE(result.ready);
+    EXPECT_FALSE(result.build_complete);
     EXPECT_EQ(upload(), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_TRUE(platform.copies.empty());
     EXPECT_EQ(platform.commits, 0);
@@ -343,6 +382,93 @@ TEST_F(HostGraphBuildTest, FailedDefinitionCopyAfterGrowthCanBeQueriedAndRetried
     platform.fail_copy = 0;
     ASSERT_GE(upload(), 0);
     ASSERT_GE(upload(), 0);
+}
+
+TEST_F(HostGraphBuildTest, BuildMeasuresInGraphTasksBeforeAnyUpload) {
+    ASSERT_GE(build(graph_entry), 0);
+    EXPECT_EQ(result.ready_queue_populations.dummy, 2u);
+    EXPECT_EQ(result.ready_queue_populations.graph_ready, 1u);
+    EXPECT_EQ(result.ready_queue_capacities.dummy, 2u);
+    EXPECT_GT(result.definition_bytes, 0u);
+    EXPECT_EQ(platform.commits, 0);
+    EXPECT_EQ(platform.definition_acquires, 0);
+    EXPECT_TRUE(platform.copies.empty());
+}
+
+TEST_F(HostGraphBuildTest, ExactGraphQueueCapacitySucceeds) {
+    ASSERT_GE(build(queue_limit_entry), 0);
+    EXPECT_EQ(result.ready_queue_populations.dummy, READY_QUEUE_CAPACITY_LIMIT);
+    EXPECT_EQ(result.ready_queue_capacities.dummy, READY_QUEUE_CAPACITY_LIMIT);
+    EXPECT_TRUE(platform.copies.empty());
+}
+
+TEST_F(HostGraphBuildTest, FailedDefinitionCopyAfterGrowthCanBeRetried) {
+    build_mixed_definitions();
+    platform.fail_copy = 1;
+    ASSERT_EQ(upload(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(result.workspace.definitions.base, platform.staging.data());
+    EXPECT_GE(result.workspace.definitions.capacity, result.definition_bytes);
+    platform.fail_copy = 0;
+    ASSERT_GE(upload(), 0);
+    ASSERT_GE(upload(), 0);
+}
+
+TEST_F(HostGraphBuildTest, FailedRebuildInvalidatesPriorResultAndCanRecover) {
+    ASSERT_GE(build(graph_entry), 0);
+    ASSERT_GT(result.definition_bytes, 0u);
+    EXPECT_LT(build(fatal_entry), 0);
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_EQ(result.definition_bytes, 0u);
+    EXPECT_EQ(result.image_bytes, 0u);
+    EXPECT_EQ(upload(), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(build(chain_entry), 2);
+    ASSERT_EQ(upload(), 2);
+}
+
+TEST_F(HostGraphBuildTest, GraphQueueOverflowFailsBeforeDeviceMutation) {
+    EXPECT_EQ(build(overflowing_graph_entry), runtime_status_from_error_code(SIMPLER_ERROR_READY_QUEUE_OVERFLOW));
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_EQ(platform.commits, 0);
+    EXPECT_EQ(platform.definition_acquires, 0);
+    EXPECT_TRUE(platform.allocations.empty());
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(upload(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(platform.definition_acquires, 0);
+}
+
+TEST_F(HostGraphBuildTest, InvalidDefinitionFailsBeforeDeviceMutation) {
+    EXPECT_EQ(build(malformed_graph_entry), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_EQ(platform.definition_acquires, 0);
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(upload(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(platform.commits, 0);
+}
+
+TEST_F(HostGraphBuildTest, UndersizedWorkspaceFailsBeforeWritingMirror) {
+    std::memset(mirror.data(), 0x5a, mirror.size());
+    EXPECT_EQ(
+        hbg::build_graph(
+            &runtime, tensor_access, {rt, mirror.data(), 1, capacity, definition_arena}, {empty_entry, bind},
+            ChipTaskArgs{}, result
+        ),
+        PTO_RUNTIME_ERR_INTERNAL
+    );
+    EXPECT_EQ(mirror.data()[0], std::byte{0x5a});
+    EXPECT_FALSE(result.build_complete);
+    EXPECT_TRUE(platform.copies.empty());
+}
+
+TEST_F(HostGraphBuildTest, UploadRejectsDifferentRuntimeBeforeDeviceMutation) {
+    ASSERT_GE(build(graph_entry), 0);
+    RuntimeContext other{};
+    EXPECT_EQ(
+        hbg::upload_for_program_mode(&runtime, &api, &other, host_arena, layout, result),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_TRUE(platform.copies.empty());
+    EXPECT_EQ(platform.definition_acquires, 0);
 }
 
 TEST_F(HostGraphBuildTest, KernelRequirementsMatchDeviceRegionsWithoutUploading) {
@@ -1145,7 +1271,7 @@ TEST_F(HbgGraphPacketTest, HeapAndDependencyReferencesSurviveCopyingThePacket) {
         static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + h.payload_offset,
         relocated.size()
     );
-    const auto to = sm_layout::segment_offsets(sm_layout::image_extents(result.usage));
+    const auto to = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
     const auto *tasks = reinterpret_cast<const ChipTaskStorage *>(relocated.data() + h.sm_offset + to.storage);
     EXPECT_EQ(tasks[0].payload.tensor_data()[0].buffer.addr, binding.heap.address + virtual_output - HEAP_VIRTUAL_BASE);
     EXPECT_EQ(tasks[1].payload.fanin_count, source[1].payload.fanin_count);
@@ -1320,7 +1446,7 @@ TEST_F(HbgGraphPacketTest, FailedCandidateKeepsPreviousSnapshotAndRejectsFullWin
     ASSERT_EQ(snapshot_graph(), 0);
     const auto original = bytes();
     result.total_tasks = capacity;
-    result.usage.submitted_tasks = capacity;
+    result.bind_usage.submitted_tasks = capacity;
     EXPECT_EQ(snapshot_graph(), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
     EXPECT_EQ(bytes(), original);
     EXPECT_EQ(provider.allocation_calls, 2);
@@ -1427,7 +1553,7 @@ TEST_F(HbgGraphPacketTest, TensorAddressesAndScalarsSurviveRelocation) {
             aligned.size()
         );
         const auto *sm = aligned.data() + first_header.sm_offset;
-        const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.usage));
+        const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
         const auto *storage = reinterpret_cast<const ChipTaskStorage *>(sm + offsets.storage);
         EXPECT_EQ(storage[0].payload.tensor_data()[0].buffer.addr, i == 0 ? 0x222000u : 0x333000u);
         EXPECT_EQ(storage[0].payload.scalar_data()[0], i == 0 ? 0x3141592653589793ULL : 0xabcdefu);
