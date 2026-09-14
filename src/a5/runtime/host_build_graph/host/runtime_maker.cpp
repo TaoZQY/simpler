@@ -2227,3 +2227,13 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
     }
     return kExtra;
 }
+
+// Kernel mode uses a separate loader manifest so its context registration
+// cannot change the program-mode runtime's resolved entry set.
+extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count) {
+    static const char *const kExtra[] = {"simpler_aicpu_l1_hbg_register_execution_slot"};
+    if (count != nullptr) {
+        *count = sizeof(kExtra) / sizeof(kExtra[0]);
+    }
+    return kExtra;
+}
