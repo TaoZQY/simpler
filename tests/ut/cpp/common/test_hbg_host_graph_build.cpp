@@ -463,8 +463,19 @@ TEST(HbgKernelRequirements, RejectsMalformedDefinitionPacking) {
     EXPECT_EQ(bytes, 17u);
 }
 
+hbg::GraphResourceRequirements resource_requirements(
+    uint64_t heap, uint64_t runtime, uint64_t definitions, uint64_t scheduler,
+    hbg::RuntimeArchitecture architecture = hbg::RuntimeArchitecture::A2A3
+) {
+    hbg::GraphResourceRequirements out{heap, runtime, definitions, scheduler};
+    out.layout = {hbg::HBG_RUNTIME_LAYOUT_ABI_VERSION, architecture, 64, 8192, 4096, 8192};
+    return out;
+}
+
 TEST(HbgKernelResourcePlan, RebuildsDisjointRegionsFromCompatibleGraphMaxima) {
-    const hbg::GraphResourceRequirements graphs[] = {{4096, 8192, 512, 0}, {8192, 4096, 0, 2048}};
+    const hbg::GraphResourceRequirements graphs[] = {
+        resource_requirements(4096, 8192, 512, 0), resource_requirements(8192, 4096, 0, 2048)
+    };
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(graphs, 2, plan), 0);
     EXPECT_EQ(plan.capacity().gm_heap_bytes, 8192u);
@@ -484,8 +495,29 @@ TEST(HbgKernelResourcePlan, RebuildsDisjointRegionsFromCompatibleGraphMaxima) {
     );
 }
 
+TEST(HbgKernelResourcePlan, RejectsDifferentArchitectureOrRuntimeLayout) {
+    const auto original = resource_requirements(4096, 8192, 512, 0);
+    hbg::KernelResourcePlan plan;
+    ASSERT_EQ(hbg::KernelResourcePlan::create(&original, 1, plan), 0);
+
+    auto other_arch = original;
+    other_arch.layout.architecture = hbg::RuntimeArchitecture::A5;
+    const hbg::GraphResourceRequirements mixed[] = {original, other_arch};
+    EXPECT_EQ(hbg::KernelResourcePlan::create(mixed, 2, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_FALSE(plan.admits(other_arch));
+
+    auto other_window = original;
+    ++other_window.layout.task_capacity;
+    EXPECT_EQ(hbg::KernelResourcePlan::create(&other_window, 1, plan), 0);
+    EXPECT_FALSE(plan.admits(original));
+
+    auto invalid = original;
+    invalid.layout.abi_version = 0;
+    EXPECT_EQ(hbg::KernelResourcePlan::create(&invalid, 1, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
 TEST(HbgKernelResourcePlan, RejectsEachRegionOverCapacityWithoutChangingThePlan) {
-    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    const auto graph = resource_requirements(4096, 8192, 512, 2048);
     hbg::KernelResourcePlan plan;
     EXPECT_FALSE(plan.admits(graph));
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
@@ -505,20 +537,23 @@ TEST(HbgKernelResourcePlan, RejectsEachRegionOverCapacityWithoutChangingThePlan)
 }
 
 TEST(HbgKernelResourcePlan, RejectsAggregateAndAlignmentOverflowWithoutPublishing) {
-    const hbg::GraphResourceRequirements good{4096, 8192, 512, 0};
+    const auto good = resource_requirements(4096, 8192, 512, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&good, 1, plan), 0);
     const auto original = plan.pipeline_contract();
-    const hbg::GraphResourceRequirements aggregate[] = {{UINT64_MAX / 2, 1, 0, 0}, {1, UINT64_MAX / 2 + 2, 0, 0}};
-    const hbg::GraphResourceRequirements alignment{1, UINT64_MAX - 512, 16, 0};
+    const hbg::GraphResourceRequirements aggregate[] = {
+        resource_requirements(UINT64_MAX / 2, 1, 0, 0),
+        resource_requirements(1, UINT64_MAX / 2 + 2, 0, 0)
+    };
+    const auto alignment = resource_requirements(1, UINT64_MAX - 512, 16, 0);
     for (const auto &graph : aggregate) {
         uint64_t total;
         ASSERT_TRUE(graph.required_bytes(total));
     }
     EXPECT_EQ(hbg::KernelResourcePlan::create(aggregate, 2, plan), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
     EXPECT_EQ(hbg::KernelResourcePlan::create(&alignment, 1, plan), PTO_RUNTIME_ERR_CAPACITY_EXCEEDED);
-    EXPECT_EQ(hbg::KernelResourcePlan::create(nullptr, 1, plan), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(hbg::KernelResourcePlan::create(&good, 0, plan), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(hbg::KernelResourcePlan::create(nullptr, 1, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(hbg::KernelResourcePlan::create(&good, 0, plan), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     const auto after = plan.pipeline_contract();
     EXPECT_EQ(std::memcmp(&after, &original, sizeof(after)), 0);
     EXPECT_EQ(plan.definition_offset(), 8192u);
@@ -526,7 +561,7 @@ TEST(HbgKernelResourcePlan, RejectsAggregateAndAlignmentOverflowWithoutPublishin
 }
 
 TEST(HbgKernelStreamBinding, BindsThreeDistinctStreamsForBothRuntimeContracts) {
-    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    const auto graph = resource_requirements(4096, 8192, 0, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     auto contract = plan.pipeline_contract();
@@ -548,7 +583,7 @@ TEST(HbgKernelStreamBinding, BindsThreeDistinctStreamsForBothRuntimeContracts) {
 }
 
 TEST(HbgKernelStreamBinding, RejectsMissingRolesAndEveryStreamAliasBeforePublishing) {
-    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    const auto graph = resource_requirements(4096, 8192, 0, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     auto contract = plan.pipeline_contract();
@@ -748,7 +783,9 @@ TEST(HbgKernelResourceContext, AggregatedCapacityRejectsExcessAndPreservesOffset
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 23), 0);
-    const hbg::GraphResourceRequirements graphs[] = {{4096, 8192, 512, 0}, {8192, 4096, 0, 2048}};
+    const hbg::GraphResourceRequirements graphs[] = {
+        resource_requirements(4096, 8192, 512, 0), resource_requirements(8192, 4096, 0, 2048)
+    };
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(graphs, 2, plan), 0);
     ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
@@ -791,7 +828,7 @@ TEST(HbgKernelResourceContext, AggregatedCapacityRejectsExcessAndPreservesOffset
 TEST(HbgKernelResourceContext, GuardsLifecycleDeviceAndGenerationBeforeBinding) {
     ResourceContextPlatform provider;
     KernelExecutionState context;
-    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    const auto graph = resource_requirements(4096, 8192, 0, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INVALID_STATE);
@@ -824,7 +861,7 @@ TEST(HbgKernelResourceContext, AllocationFailureRollsBackAndCanBeRetried) {
         provider.fail_allocation = failure;
         KernelExecutionState context;
         ASSERT_EQ(context.initialize(0, provider.context_ops(), 41), 0);
-        const hbg::GraphResourceRequirements graph{4096, 8192, 512, 0};
+        const auto graph = resource_requirements(4096, 8192, 512, 0);
         hbg::KernelResourcePlan plan;
         ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
         EXPECT_EQ(plan.prepare(context, provider.resource_ops()), PTO_RUNTIME_ERR_INTERNAL);
@@ -843,7 +880,7 @@ TEST(HbgKernelResourceContext, FailedRollbackAndFailedCloseRetainOwnershipForRet
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 43), 0);
-    const hbg::GraphResourceRequirements graph{4096, 8192, 0, 0};
+    const auto graph = resource_requirements(4096, 8192, 0, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     provider.fail_allocation = 2;
@@ -868,7 +905,7 @@ TEST(HbgKernelResourceContext, UsesThePlatformAllocatorAndReleasesOnlyContextOwn
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 47), 0);
-    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    const auto graph = resource_requirements(4096, 8192, 512, 2048);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     ASSERT_EQ(plan.prepare(context, KernelResourceOps::from_allocator(allocator)), 0);
@@ -883,7 +920,7 @@ TEST(HbgKernelResourceContext, InvalidLayoutsFailBeforeAnyDeviceAllocation) {
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 53), 0);
-    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 0};
+    const auto graph = resource_requirements(4096, 8192, 512, 0);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     const KernelResourceLayout valid{
@@ -925,7 +962,7 @@ TEST(HbgKernelResourceContext, ConcurrentPrepareAllocatesOneSlotAndCloseFailureB
     ResourceContextPlatform provider;
     KernelExecutionState context;
     ASSERT_EQ(context.initialize(0, provider.context_ops(), 59), 0);
-    const hbg::GraphResourceRequirements graph{4096, 8192, 512, 2048};
+    const auto graph = resource_requirements(4096, 8192, 512, 2048);
     hbg::KernelResourcePlan plan;
     ASSERT_EQ(hbg::KernelResourcePlan::create(&graph, 1, plan), 0);
     auto prepare = [&] {

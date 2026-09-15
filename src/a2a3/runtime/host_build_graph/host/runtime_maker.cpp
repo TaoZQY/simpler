@@ -792,6 +792,10 @@ int32_t hbg::get_graph_resource_requirements(
     }
     if (build.image_bytes > UINT64_MAX - layout.off_copied_end) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
     GraphResourceRequirements next{};
+    next.layout = {
+        HBG_RUNTIME_LAYOUT_ABI_VERSION, RuntimeArchitecture::A2A3, layout.task_capacity, layout.arena_size,
+        layout.off_copied_begin, layout.off_copied_end
+    };
     next.gm_heap_bytes = build.heap_bytes;
     next.runtime_arena_bytes = layout.off_copied_end + build.image_bytes;
     if (!graph_definition_block_bytes(

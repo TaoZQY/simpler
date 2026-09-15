@@ -52,6 +52,7 @@ resource discovery runs outside capture.
 | `runtime_arena_bytes` | Device-only prefix, RuntimeContext and compact SM tail; SM is counted once |
 | `graph_definition_bytes` | Used retained prefix plus aligned spill objects and framing; distinct Definitions counted once |
 | `scheduler_state_bytes` | A5 scheduler allocation upper bound including alignment slack; zero on A2/A3 and A5 Graph fallback |
+| `layout` | Architecture, HBG layout ABI, task window and copied-zone identity used to interpret the image offsets |
 
 `required_bytes()` checks the sum of these logical requirements. It is neither
 committed HBM telemetry nor context capacity. Public committed-memory reporting
@@ -60,7 +61,10 @@ code and CANN packets are outside this graph calculation.
 
 `KernelResourcePlan::create(graphs, count, out)` builds a capacity declaration
 for one serialized execution slot. Inputs must belong to the same context's
-architecture and runtime layout ABI. It takes the maximum of each compatible
+architecture and runtime layout ABI. Matching byte totals do not make layouts
+compatible: the architecture, task window, arena extent and copied-zone bounds
+must all match. Invalid or mixed layout identities return `INVALID_ARGUMENT`
+without changing an existing plan. It takes the maximum of each compatible
 region requirement, then **recomputes** aligned Definition and scheduler offsets
 after the runtime/SM capacity. It then reserves a separate aligned
 `GraphSlotRegistry` control region, excluded from every restore image.
@@ -99,7 +103,7 @@ allocations and rejects dispatch until explicit close retries succeed.
 
 `context.freeze_resources()` is a distinct transition, accepted only after
 successful resource preparation. `bind_kernel_resources_for_launch` then checks
-ready state, device/generation identity, the HBG region schema and each required
+ready state, device/context-slot identity, the HBG region schema and each required
 size before returning `KernelWorkingBinding`. It does not allocate, free, copy,
 clear or replace any buffer. Mutable state must be restored later by the device
 from the invocation's immutable source. Caller must serialize binding/enqueue
@@ -126,7 +130,10 @@ committed-byte accounting (including alignment slack). It must remain alive
 until explicit context close; neither its destructor nor program teardown may
 run while captured graphs reference the context. Context close releases only
 its own allocations, never caller tensors. External workspace injection remains
-deferred. Expanding a captured context requires a new generation and slot.
+deferred. Expanding a captured context requires a new context slot. This
+internal slot identity is separate from callable registration: current K1 mints
+an `int32_t callable_id` in `prepare_callable` and carries no callable generation
+in the 32-byte invocation header.
 
 HBG's public kernel launch remains unsupported. The resource lifecycle and
 immutable HBG packet producer are implemented internally, but H4 device restore
@@ -222,8 +229,8 @@ inline payload:
   full A5 scheduler capacity, if nonzero
 ```
 
-The HBG header carries context slot generation separately from K9's callable
-residency generation, device ID, runtime binary identity, per-invocation hashes,
+The HBG header carries an internal context-slot identity, device ID, runtime
+binary identity, per-invocation hashes,
 task count/window, runtime/SM offsets and
 four destination base/capacity pairs. Region source offsets are relative to the
 inline payload; destination offsets are relative to the selected working region.

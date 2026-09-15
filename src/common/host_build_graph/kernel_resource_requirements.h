@@ -25,6 +25,37 @@ namespace hbg {
 
 static_assert(GRAPH_DEFINITION_OBJECT_ALIGN <= DeviceArena::kDefaultBaseAlign);
 
+enum class RuntimeArchitecture : uint32_t {
+    A2A3 = 1,
+    A5 = 2,
+};
+
+inline constexpr uint32_t HBG_RUNTIME_LAYOUT_ABI_VERSION = 1;
+
+// Identifies the runtime layout whose offsets the snapshot describes. Equal
+// byte totals are not enough: A2/A3 and A5 images have different internal
+// layouts, and task windows change the pitch used by the device.
+struct RuntimeLayoutKey {
+    uint32_t abi_version{0};
+    RuntimeArchitecture architecture{};
+    uint64_t task_capacity{0};
+    uint64_t arena_bytes{0};
+    uint64_t copied_begin{0};
+    uint64_t copied_end{0};
+
+    bool valid() const {
+        return abi_version == HBG_RUNTIME_LAYOUT_ABI_VERSION &&
+               (architecture == RuntimeArchitecture::A2A3 || architecture == RuntimeArchitecture::A5) &&
+               task_capacity != 0 && copied_begin <= copied_end && copied_end == arena_bytes;
+    }
+};
+
+inline bool operator==(const RuntimeLayoutKey &lhs, const RuntimeLayoutKey &rhs) {
+    return lhs.abi_version == rhs.abi_version && lhs.architecture == rhs.architecture &&
+           lhs.task_capacity == rhs.task_capacity && lhs.arena_bytes == rhs.arena_bytes &&
+           lhs.copied_begin == rhs.copied_begin && lhs.copied_end == rhs.copied_end;
+}
+
 // Host-only value snapshot, independent of the build's borrowed buffers. Sizes
 // exclude caller tensor storage, code residency and CANN-owned capture packets.
 struct GraphResourceRequirements {
@@ -32,6 +63,7 @@ struct GraphResourceRequirements {
     uint64_t runtime_arena_bytes{0};  // Includes the compact SM image exactly once.
     uint64_t graph_definition_bytes{0};
     uint64_t scheduler_state_bytes{0};  // A5 upper bound; zero for the Graph fallback.
+    RuntimeLayoutKey layout{};
 
     // Logical storage requirements, not committed HBM or a frozen capacity.
     bool required_bytes(uint64_t &bytes) const {
@@ -58,10 +90,14 @@ struct GraphResourceRequirements {
 class KernelResourcePlan {
 public:
     static int create(const GraphResourceRequirements *graphs, size_t count, KernelResourcePlan &out) {
-        if (graphs == nullptr || count == 0) return PTO_RUNTIME_ERR_INTERNAL;
+        if (graphs == nullptr || count == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         KernelResourcePlan next;
+        next.capacity_.layout = graphs[0].layout;
         for (size_t i = 0; i < count; ++i) {
             uint64_t bytes = 0;
+            if (!graphs[i].layout.valid() || !(graphs[i].layout == next.capacity_.layout)) {
+                return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+            }
             if (!graphs[i].required_bytes(bytes)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
             next.capacity_.gm_heap_bytes = std::max(next.capacity_.gm_heap_bytes, graphs[i].gm_heap_bytes);
             next.capacity_.runtime_arena_bytes =
@@ -93,7 +129,8 @@ public:
 
     bool admits(const GraphResourceRequirements &graph) const {
         uint64_t bytes = 0;
-        return runtime_arena_bytes_ != 0 && graph.required_bytes(bytes) &&
+        return runtime_arena_bytes_ != 0 && graph.layout.valid() && graph.layout == capacity_.layout &&
+               graph.required_bytes(bytes) &&
                graph.gm_heap_bytes <= capacity_.gm_heap_bytes &&
                graph.runtime_arena_bytes <= capacity_.runtime_arena_bytes &&
                graph.graph_definition_bytes <= capacity_.graph_definition_bytes &&
