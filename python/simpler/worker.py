@@ -7010,9 +7010,10 @@ class Worker:
         """Register ``chip_callable`` with this kernel-mode context; returns the id the runtime minted.
 
         Unrelated to ``register()``: there is no digest dedup, no handle, and no pre-init recording,
-        so the same callable prepared twice takes two distinct, equally valid ids. The call blocks
-        until the device-side registration is committed and raises its failure; call it outside graph
-        capture. The Worker keeps every prepared image alive until ``close()`` tears the context down,
+        so the same callable prepared twice takes two distinct, equally valid ids. Preparation uploads
+        context-owned images without stream/event/device synchronization and may run inside graph
+        capture after ``init()`` has completed outside capture. HBG orders device registration before
+        execution on each launch's AICPU stream. The Worker keeps every prepared image alive until ``close()``,
         because the device holds addresses into it. Requires a READY kernel-mode Worker, called in the
         process that initialized it.
         """

@@ -67,8 +67,8 @@ _CASE_RUNTIMES = {
     "dfx_many_launches_task_timing": (_TMR,),
     "dfx_window_scope": (_TMR,),
     "dfx_window_scope_task_timing": (_TMR,),
-    "hbg_init_refused": (_HBG,),
 }
+_HBG_CASE_RUNTIMES = {"hbg_eager_numerics": (_HBG,)}
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ def _kernel_worker(caller: _Caller, platform: str, runtime: str = _TMR):
 # ---------------------------------------------------------------------------
 
 
-def _build_eager_callable(platform: str):
+def _build_eager_callable(platform: str, runtime: str = _TMR):
     """The ChipCallable ``kernel_eager_orchestration(x, y, scalar)`` submitting one AIV add-scalar task."""
     import tempfile
 
@@ -225,12 +225,12 @@ def _build_eager_callable(platform: str):
     kernel = _PROJECT_ROOT / "examples" / platform / _TMR / "vector_example/kernels/aiv/kernel_add_scalar.cpp"
     orchestration_source = _PROJECT_ROOT / "tests/ut/py/kernel_eager_orchestration.cpp"
     with tempfile.TemporaryDirectory(prefix="worker-kernel-eager-") as build_dir:
-        orchestration = compiler.compile_orchestration(_TMR, str(orchestration_source), build_dir=build_dir)
+        orchestration = compiler.compile_orchestration(runtime, str(orchestration_source), build_dir=build_dir)
         incore = compiler.compile_incore(
             str(kernel),
             core_type="aiv",
             pto_isa_root=ensure_pto_isa_root(),
-            extra_include_dirs=compiler.get_orchestration_include_dirs(_TMR),
+            extra_include_dirs=compiler.get_orchestration_include_dirs(runtime),
             build_dir=build_dir,
         )
     signature = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
@@ -316,7 +316,7 @@ def _case_supported_before_init(platform: str, device: int) -> None:
     """kernel_mode_supported answers from the runtime build before init, with no device made current."""
     from simpler.worker import Worker
 
-    for runtime, expected in ((_TMR, True), (_HBG, False)):
+    for runtime, expected in ((_TMR, True), (_HBG, True)):
         kernel = Worker(level=2, execution_mode="kernel", device_id=device, platform=platform, runtime=runtime)
         program = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
         for worker in (kernel, program):
@@ -537,17 +537,24 @@ def _case_dfx_window_scope(platform: str, device: int, *, level: int = 4) -> Non
             worker.close()
 
 
-def _case_hbg_init_refused(platform: str, device: int) -> None:
-    """host_build_graph has no kernel mode: init fails to FAILED, close() is clean, the caller's stream survives."""
+def _case_hbg_eager_numerics(platform: str, device: int) -> None:
+    """HBG builds a per-launch graph snapshot and executes it on the three-stream kernel path."""
+    chip = _build_eager_callable(platform, _HBG)
     with _caller_device(device) as caller, _kernel_worker(caller, platform, runtime=_HBG) as worker:
-        with pytest.raises(RuntimeError, match="kernel mode"):
-            worker.init(config=_kernel_config())
-        assert worker._lifecycle.name == "FAILED"
-        assert worker._kernel_pin_finalizer is None
+        pin_finalizer = _init_kernel_worker(worker)
+        assert worker.kernel_mode_supported is True
+        callable_id = worker.kernel_prepare_callable(chip)
+        committed = worker.committed_device_memory()
+        assert committed > 0
+
+        first = _launch_and_check(caller, worker, callable_id, scalar=1.25, seed=7)
+        _launch_and_check(caller, worker, callable_id, scalar=-3.5, seed=8)
+        assert worker.committed_device_memory() == committed
+        assert caller.read(first[1]) == first[2]
+
         assert caller.synchronize() == 0
         worker.close()
-        assert worker._lifecycle.name == "CLOSED"
-        assert worker._chip_worker is None
+        _assert_closed_cleanly(worker, pin_finalizer)
 
 
 _CASES = {
@@ -561,7 +568,7 @@ _CASES = {
     "dfx_many_launches_task_timing": partial(_case_dfx_bracket, rounds=32, level=1),
     "dfx_window_scope": _case_dfx_window_scope,
     "dfx_window_scope_task_timing": partial(_case_dfx_window_scope, level=1),
-    "hbg_init_refused": _case_hbg_init_refused,
+    "hbg_eager_numerics": _case_hbg_eager_numerics,
 }
 
 
@@ -614,6 +621,18 @@ def test_worker_kernel_mode_on_caller_device(case, st_platform, st_device_ids):
     """Drive one Worker kernel-mode case against a device, stream and memory the case itself owns."""
     assert st_device_ids, "device_count(1) must yield at least one device id"
     _require_prebuilt(st_platform, _CASE_RUNTIMES[case])
+    _run_case_in_subprocess(case, st_platform, int(st_device_ids[0]))
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.parametrize("case", list(_HBG_CASE_RUNTIMES))
+def test_hbg_worker_kernel_mode_on_caller_device(case, st_platform, st_device_ids):
+    """Execute the public Worker HBG kernel path on caller-owned stream and tensors."""
+    assert st_device_ids, "device_count(1) must yield at least one device id"
+    _require_prebuilt(st_platform, _HBG_CASE_RUNTIMES[case])
     _run_case_in_subprocess(case, st_platform, int(st_device_ids[0]))
 
 
